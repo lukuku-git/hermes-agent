@@ -1047,23 +1047,28 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
+    fast_head_execution = bool(getattr(agent, "_fast_head_execution", False))
+
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
-            "pre_llm_call",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=original_user_message,
-            conversation_history=list(messages),
-            is_first_turn=(not bool(conversation_history)),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
-        )
+        if fast_head_execution:
+            _pre_results = []
+        else:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _pre_results = _invoke_hook(
+                "pre_llm_call",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                user_message=original_user_message,
+                conversation_history=list(messages),
+                is_first_turn=(not bool(conversation_history)),
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+                parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+                sender_id=getattr(agent, "_user_id", None) or "",
+            )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin
         # can't inflate every subsequent turn's prompt. Ported from
@@ -1108,6 +1113,8 @@ def build_turn_context(
     # Multimodal (list) content can't take the string sidecar — append a
     # durable text part instead of dropping the fact.
     _gateway_notes = consume_gateway_turn_context_notes(agent)
+    if fast_head_execution:
+        _gateway_notes = ""
     if _gateway_notes:
         _gw_turn_content = (
             messages[current_turn_user_idx].get("content")
@@ -1144,7 +1151,7 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    if agent._memory_manager and not fast_head_execution:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -1153,7 +1160,7 @@ def build_turn_context(
 
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if agent._memory_manager and not fast_head_execution:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""

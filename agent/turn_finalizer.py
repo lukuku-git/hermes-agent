@@ -66,6 +66,17 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def fast_head_allows_summary_fallback(agent) -> bool:
+    return not getattr(agent, "_fast_head_execution", False)
+
+
+def result_transport_calls(agent, api_call_count: int) -> int:
+    """Expose logical operator calls; Fast Head tracks exact physical attempts."""
+    if getattr(agent, "_fast_head_execution", False):
+        return int(getattr(agent, "_fast_head_transport_calls", 0) or 0)
+    return int(api_call_count or 0)
+
+
 def finalize_turn(
     agent,
     *,
@@ -100,6 +111,7 @@ def finalize_turn(
         and not interrupted
         and not failed
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
+        and fast_head_allows_summary_fallback(agent)
     )
     continuation_budget_exhausted = (
         final_response is None
@@ -544,7 +556,8 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if (final_response and not interrupted
+            and not getattr(agent, "_fast_head_execution", False)):
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -566,7 +579,8 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
     # to an external memory system).
-    if final_response and not interrupted:
+    if (final_response and not interrupted
+            and not getattr(agent, "_fast_head_execution", False)):
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -596,18 +610,19 @@ def finalize_turn(
         # provider response (early failure / interrupt), which is exactly the
         # contract: real usage when available, ``None`` otherwise.
         _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
+        if not getattr(agent, "_fast_head_execution", False):
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
     except Exception as exc:
         logger.warning("on_turn_complete notification failed: %s", exc)
 
@@ -634,6 +649,7 @@ def finalize_turn(
         "last_reasoning": last_reasoning,
         "messages": messages,
         "api_calls": api_call_count,
+        "transport_calls": result_transport_calls(agent, api_call_count),
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
@@ -733,22 +749,23 @@ def finalize_turn(
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            turn_exit_reason=_turn_exit_reason,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_end hook failed: %s", exc)
+    if not getattr(agent, "_fast_head_execution", False):
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_end",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                completed=completed,
+                failed=failed,
+                interrupted=interrupted,
+                turn_exit_reason=_turn_exit_reason,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_end hook failed: %s", exc)
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False

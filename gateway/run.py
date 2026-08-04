@@ -4296,20 +4296,22 @@ class TurnRunner:
         # Combine platform context, YAML channel_prompts hint for this chat,
         # channel_overrides system_prompt (or global ephemeral), and gateway
         # ephemeral prompt from _get_system_prompt_for_channel.
-        combined_ephemeral = ctx.context_prompt or ""
-        event_channel_prompt = (ctx.channel_prompt or "").strip()
-        if event_channel_prompt:
-            combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
-        cfg_channel_prompt = self._runner._get_system_prompt_for_channel(
-            ctx.source.platform,
-            ctx.source.chat_id or "",
-            thread_id=getattr(ctx.source, "thread_id", None),
-            parent_id=getattr(ctx.source, "parent_chat_id", None),
-        )
-        if cfg_channel_prompt:
-            combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+        combined_ephemeral = ""
+        if ctx.route_mode != "fast_head":
+            combined_ephemeral = ctx.context_prompt or ""
+            event_channel_prompt = (ctx.channel_prompt or "").strip()
+            if event_channel_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+            cfg_channel_prompt = self._runner._get_system_prompt_for_channel(
+                ctx.source.platform,
+                ctx.source.chat_id or "",
+                thread_id=getattr(ctx.source, "thread_id", None),
+                parent_id=getattr(ctx.source, "parent_chat_id", None),
+            )
+            if cfg_channel_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
 
-        max_iterations = _current_max_iterations()
+        max_iterations = 1 if ctx.route_mode == "fast_head" else _current_max_iterations()
 
         try:
             model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
@@ -4329,12 +4331,43 @@ class TurnRunner:
                 "tools": [],
             }
 
+        turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        if ctx.route_mode == "fast_head":
+            from gateway.fast_head import RouteDecision, constrain_fast_head_route_for_runtime
+            _bounded_route = constrain_fast_head_route_for_runtime(
+                RouteDecision(ctx.route_mode, ctx.route_reason),
+                turn_route.get("runtime"),
+                moa_active=ctx.moa_config is not None,
+            )
+            if _bounded_route.mode != "fast_head":
+                ctx.route_mode = _bounded_route.mode
+                ctx.route_reason = _bounded_route.reason
+                from hermes_cli.tools_config import _get_platform_tools
+                ctx.enabled_toolsets = sorted(_get_platform_tools(ctx.user_config, platform_key))
+                _agent_cfg = ctx.user_config.get("agent") or {}
+                ctx.disabled_toolsets = _agent_cfg.get("disabled_toolsets") or None
+                combined_ephemeral = ctx.context_prompt or ""
+                event_channel_prompt = (ctx.channel_prompt or "").strip()
+                if event_channel_prompt:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+                cfg_channel_prompt = self._runner._get_system_prompt_for_channel(
+                    ctx.source.platform, ctx.source.chat_id or "",
+                    thread_id=getattr(ctx.source, "thread_id", None),
+                    parent_id=getattr(ctx.source, "parent_chat_id", None),
+                )
+                if cfg_channel_prompt:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+                max_iterations = _current_max_iterations()
+
         pr = self._runner._provider_routing
-        reasoning_config = self._runner._resolve_session_reasoning_config(
-            source=ctx.source,
-            session_key=ctx.session_key,
-            model=model,
-        )
+        if ctx.route_mode == "fast_head":
+            reasoning_config = {"enabled": False, "effort": "none"}
+        else:
+            reasoning_config = self._runner._resolve_session_reasoning_config(
+                source=ctx.source,
+                session_key=ctx.session_key,
+                model=model,
+            )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
             source=ctx.source, session_key=ctx.session_key
@@ -4434,7 +4467,7 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
-        turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        _cache_session_key = self._runner._agent_cache_key(ctx.session_key, ctx.route_mode)
 
         # Check agent cache — reuse the AIAgent from the previous message
         # in this session to preserve the frozen system prompt and tool
@@ -4447,6 +4480,12 @@ class TurnRunner:
             cache_keys=self._runner._extract_cache_busting_config(ctx.user_config),
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
+            cache_mode=ctx.route_mode,
+            fast_head_prompt=(
+                ctx.fast_head_config.system_prompt
+                if ctx.route_mode == "fast_head"
+                else ""
+            ),
         )
         agent = None
         reused_cached_agent = False
@@ -4470,7 +4509,7 @@ class TurnRunner:
         _peek_cached_sid = None
         if _cache_lock and _cache is not None:
             with _cache_lock:
-                _peek_entry = _cache.get(ctx.session_key)
+                _peek_entry = _cache.get(_cache_session_key)
             if _peek_entry and len(_peek_entry) > 3:
                 _peek_cached_sid = _peek_entry[3]
         _cached_sid_is_dead = False
@@ -4505,7 +4544,7 @@ class TurnRunner:
         _xproc_evicted_agent = None
         if _cache_lock and _cache is not None:
             with _cache_lock:
-                cached = _cache.get(ctx.session_key)
+                cached = _cache.get(_cache_session_key)
                 if cached and cached[1] == _sig:
                     # cached[2] is the message_count at cache time;
                     # stale when a second process appended rows.
@@ -4560,7 +4599,7 @@ class TurnRunner:
                             "reusing across the routing recovery",
                             ctx.session_key, _cached_sid,
                         )
-                        evicted = self._runner._agent_cache.pop(ctx.session_key, None)
+                        evicted = self._runner._agent_cache.pop(_cache_session_key, None)
                         _ev_agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
                         if _ev_agent and _ev_agent is not _AGENT_PENDING_SENTINEL:
                             # Same deferred-cleanup rationale as the
@@ -4568,11 +4607,10 @@ class TurnRunner:
                             # block the event loop / cache lock on
                             # memory-provider shutdown or socket teardown.
                             _xproc_evicted_agent = _ev_agent
-                    elif (
-                        not _session_id_mismatch
-                        and _cached_mc is not None
-                        and _current_msg_count is not None
-                        and _current_msg_count != _cached_mc
+                    elif not self._runner._cache_entry_matches_transcript(
+                        cached,
+                        current_message_count=_current_msg_count,
+                        session_id=ctx.session_id,
                     ):
                         # Cross-process write detected — discard stale
                         # agent so it rebuilds from fresh DB transcript.
@@ -4582,7 +4620,7 @@ class TurnRunner:
                             "possible cross-process write",
                             ctx.session_key, _cached_mc, _current_msg_count,
                         )
-                        evicted = self._runner._agent_cache.pop(ctx.session_key, None)
+                        evicted = self._runner._agent_cache.pop(_cache_session_key, None)
                         _ev_agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
                         if _ev_agent and _ev_agent is not _AGENT_PENDING_SENTINEL:
                             # Defer cleanup until AFTER the lock is
@@ -4605,7 +4643,7 @@ class TurnRunner:
                         # truly-oldest entries, not the one we just used.
                         if hasattr(_cache, "move_to_end"):
                             try:
-                                _cache.move_to_end(ctx.session_key)
+                                _cache.move_to_end(_cache_session_key)
                             except KeyError:
                                 pass
                         self._runner._init_cached_agent_for_turn(agent, ctx._interrupt_depth)
@@ -4648,19 +4686,27 @@ class TurnRunner:
                     pass
 
         if agent is None:
-            # Config changed or first message — create fresh agent
+            # Config changed or first message — create fresh agent. Fast-head
+            # restrictions are constructor-time invariants, never mutations of
+            # an operator agent, so both upstream prompt/tool caches stay stable.
+            _mode_kwargs = {
+                "max_iterations": max_iterations,
+                "enabled_toolsets": ctx.enabled_toolsets,
+                "disabled_toolsets": ctx.disabled_toolsets,
+                "ephemeral_system_prompt": combined_ephemeral or None,
+                "prefill_messages": self._runner._prefill_messages or None,
+                "reasoning_config": reasoning_config,
+            }
+            if ctx.route_mode == "fast_head":
+                from gateway.fast_head import fast_head_agent_overrides
+                _mode_kwargs = fast_head_agent_overrides(ctx.fast_head_config)
             agent = ctx.AIAgent(
                 model=turn_route["model"],
                 **turn_route["runtime"],
                 **_checkpoint_agent_kwargs(ctx.user_config),
-                max_iterations=max_iterations,
                 quiet_mode=True,
                 verbose_logging=False,
-                enabled_toolsets=ctx.enabled_toolsets,
-                disabled_toolsets=ctx.disabled_toolsets,
-                ephemeral_system_prompt=combined_ephemeral or None,
-                prefill_messages=self._runner._prefill_messages or None,
-                reasoning_config=reasoning_config,
+                **_mode_kwargs,
                 service_tier=self._runner._service_tier,
                 request_overrides=turn_route.get("request_overrides"),
                 providers_allowed=pr.get("only"),
@@ -4690,7 +4736,7 @@ class TurnRunner:
                     # guard can skip the (meaningless) count comparison
                     # when the active session_id later switches under
                     # the same session_key (#54947).
-                    _cache[ctx.session_key] = (
+                    _cache[_cache_session_key] = (
                         agent, _sig, _current_msg_count, ctx.session_id,
                     )
                     self._runner._enforce_agent_cache_cap()
@@ -5270,10 +5316,12 @@ class TurnRunner:
             else:
                 _run_message = ctx.message
 
-            _api_run_message = _wrap_current_message_with_observed_context(
-                _run_message,
-                observed_group_context,
-            )
+            _api_run_message = _run_message
+            if ctx.route_mode != "fast_head":
+                _api_run_message = _wrap_current_message_with_observed_context(
+                    _run_message,
+                    observed_group_context,
+                )
             _conversation_kwargs = {
                 "conversation_history": agent_history,
                 "task_id": ctx.session_id,
@@ -5282,11 +5330,25 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
                 _conversation_kwargs["persist_user_message"] = ctx.message
-            if ctx.moa_config is not None:
+            if ctx.moa_config is not None and ctx.route_mode != "fast_head":
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            api_calls = int(result.get("api_calls", 0) or 0)
+            transport_calls = int(result.get("transport_calls", api_calls) or 0)
+            result["gateway_route"] = ctx.route_mode
+            result["gateway_route_reason"] = ctx.route_reason
+            result["transport_calls"] = transport_calls
+            if ctx.route_mode == "fast_head" and transport_calls > 1:
+                raise RuntimeError("Fast Head exceeded its one-call transport budget")
+            logger.info(
+                "Gateway route mode=%s reason=%s api_calls=%d session=%s",
+                ctx.route_mode,
+                ctx.route_reason,
+                api_calls,
+                ctx.session_key or "",
+            )
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -5436,6 +5498,9 @@ class TurnRunner:
                 "final_response": final_response,
                 "messages": result.get("messages", []),
                 "api_calls": result.get("api_calls", 0),
+                "transport_calls": result.get("transport_calls", result.get("api_calls", 0)),
+                "gateway_route": result.get("gateway_route", ctx.route_mode),
+                "gateway_route_reason": result.get("gateway_route_reason", ctx.route_reason),
                 "failed": result.get("failed", False),
                 # Sibling of the non-empty-response return below (#64686):
                 # the classifier's failure_reason must survive the
@@ -5501,7 +5566,7 @@ class TurnRunner:
                 final_response = final_response + "\n" + "\n".join(unique_tags)
 
         # Auto-generate session title after first exchange (non-blocking)
-        if final_response and self._runner._session_db:
+        if final_response and self._runner._session_db and ctx.route_mode != "fast_head":
             try:
                 from agent.title_generator import maybe_auto_title
                 all_msgs = ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else []
@@ -5574,6 +5639,9 @@ class TurnRunner:
             "last_reasoning": result.get("last_reasoning"),
             "messages": ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else [],
             "api_calls": ctx.result_holder[0].get("api_calls", 0) if ctx.result_holder[0] else 0,
+            "transport_calls": ctx.result_holder[0].get("transport_calls", 0) if ctx.result_holder[0] else 0,
+            "gateway_route": ctx.result_holder[0].get("gateway_route", ctx.route_mode) if ctx.result_holder[0] else ctx.route_mode,
+            "gateway_route_reason": ctx.result_holder[0].get("gateway_route_reason", ctx.route_reason) if ctx.result_holder[0] else ctx.route_reason,
             "failed": ctx.result_holder[0].get("failed", False) if ctx.result_holder[0] else False,
             "failure_reason": (
                 ctx.result_holder[0].get("failure_reason") if ctx.result_holder[0] else None
@@ -15968,6 +16036,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state.persistent.native_image_paths = []
         return paths
 
+    def _classify_fast_head_route_for_session(
+        self, message: Any, *, enabled: bool, message_type: Any, session_key: str
+    ):
+        """Classify with the real, unconsumed native-image buffer in scope."""
+        from gateway.fast_head import classify_fast_head_route
+
+        state = self._peek_session_state(session_key) if session_key else None
+        has_native_images = bool(
+            state is not None and state.persistent.native_image_paths
+        )
+        return classify_fast_head_route(
+            message,
+            enabled=enabled,
+            has_attachments=has_native_images,
+            message_type=message_type,
+        )
+
     def _cache_session_source(self, session_key: str, source) -> None:
         if not session_key or source is None:
             return
@@ -17809,7 +17894,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # here makes the guard fire only on a DIFFERENT process's writes.
             # Fail-safe inside the helper.
             await self._refresh_agent_cache_message_count(
-                session_key, session_entry.session_id
+                session_key,
+                session_entry.session_id,
+                cache_mode=str(agent_result.get("gateway_route") or "operator"),
             )
 
             # Intentional silence is a delivery decision, not a transcript
@@ -22212,6 +22299,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return out
 
     @staticmethod
+    def _agent_cache_key(session_key: str, cache_mode: str) -> str:
+        """Keep independent byte-stable agents for operator and fast-head modes."""
+        if cache_mode == "fast_head":
+            return f"{session_key}::fast_head"
+        return session_key
+
+    @staticmethod
+    def _cache_entry_matches_transcript(
+        cached: Any,
+        *,
+        current_message_count: Optional[int],
+        session_id: Optional[str],
+    ) -> bool:
+        """Return the production pre-turn transcript-coherence decision."""
+        if not isinstance(cached, tuple) or len(cached) < 3:
+            return True
+        cached_count = cached[2]
+        cached_session_id = cached[3] if len(cached) > 3 else None
+        if (
+            cached_session_id is not None
+            and session_id is not None
+            and cached_session_id != session_id
+        ):
+            return True
+        return (
+            cached_count is None
+            or current_message_count is None
+            or cached_count == current_message_count
+        )
+
+    @staticmethod
     def _agent_config_signature(
         model: str,
         runtime: dict,
@@ -22220,6 +22338,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        cache_mode: str = "operator",
+        fast_head_prompt: str = "",
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -22274,6 +22394,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cache_keys_sorted,
                 str(user_id or ""),
                 str(user_id_alt or ""),
+                cache_mode,
+                fast_head_prompt if cache_mode == "fast_head" else "",
             ],
             sort_keys=True,
             default=str,
@@ -22749,7 +22871,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._evict_cached_agent(session_key)
 
     async def _refresh_agent_cache_message_count(
-        self, session_key: str, session_id: Optional[str]
+        self,
+        session_key: str,
+        session_id: Optional[str],
+        *,
+        cache_mode: str = "operator",
     ) -> None:
         """Re-baseline a cached agent's stored message_count after THIS turn.
 
@@ -22766,8 +22892,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Call this once a turn has completed and the agent has flushed its
         rows to the SessionDB.  It snapshots the now-current count (which
-        includes this process's own writes) so the guard only fires when a
-        DIFFERENT process changes the transcript out from under us.  The
+        includes this process's own writes) onto both warm mode entries, so
+        alternating Fast/Operator turns cannot impersonate a cross-process
+        write. ``cache_mode`` remains a compatibility-only keyword. The
         ``_sig`` is left untouched; only the count element is refreshed, and
         only when the same agent is still cached (no rebuild/eviction raced
         in between).  Fail-safe: any DB error leaves the snapshot as-is, which
@@ -22796,30 +22923,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _live is None:
             return
         with _cache_lock:
-            cached = _cache.get(session_key)
-            # Only re-baseline a live 3-tuple entry; skip pending sentinels,
-            # legacy 2-tuples (they intentionally opt out of the guard), and
-            # the case where the entry was evicted/rebuilt mid-turn.
-            if (
-                isinstance(cached, tuple)
-                and len(cached) > 2
-                and cached[0] is not _AGENT_PENDING_SENTINEL
+            # Fast and Operator share one transcript. Every warm mode entry
+            # therefore receives the same committed post-turn baseline.
+            for _cache_session_key in (
+                self._agent_cache_key(session_key, "operator"),
+                self._agent_cache_key(session_key, "fast_head"),
             ):
+                cached = _cache.get(_cache_session_key)
+                if not (
+                    isinstance(cached, tuple)
+                    and len(cached) > 2
+                    and cached[0] is not _AGENT_PENDING_SENTINEL
+                ):
+                    continue
                 # If the snapshot was taken for a different session_id
                 # (same session_key, different conversation), leave the
                 # snapshot alone — the current session_id's count belongs
                 # to a different DB row (#54947).
                 _snapshot_sid = cached[3] if len(cached) > 3 else None
                 if _snapshot_sid is not None and _snapshot_sid != session_id:
-                    return
+                    continue
                 if cached[2] != _live:
                     if _snapshot_sid is None:
                         # Legacy 3-tuple: preserve the original 3-element
                         # shape so existing entries stay compatible with
                         # callers that index ``cached[2]`` directly.
-                        _cache[session_key] = (cached[0], cached[1], _live)
+                        _cache[_cache_session_key] = (cached[0], cached[1], _live)
                     else:
-                        _cache[session_key] = (
+                        _cache[_cache_session_key] = (
                             cached[0], cached[1], _live, _snapshot_sid,
                         )
 
@@ -23006,17 +23137,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _evict_state.conversation.vc_last = None
 
         _lock = getattr(self, "_agent_cache_lock", None)
-        evicted = None
+        cache_keys = (
+            self._agent_cache_key(session_key, "operator"),
+            self._agent_cache_key(session_key, "fast_head"),
+        )
+        evicted_entries = []
         if _lock:
             with _lock:
-                evicted = self._agent_cache.pop(session_key, None)
+                evicted_entries = [
+                    self._agent_cache.pop(key, None) for key in cache_keys
+                ]
         else:
             _cache = getattr(self, "_agent_cache", None)
             if _cache is not None:
-                evicted = _cache.pop(session_key, None)
+                evicted_entries = [_cache.pop(key, None) for key in cache_keys]
 
-        agent = evicted[0] if isinstance(evicted, tuple) and evicted else evicted
-        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+        agents = [
+            entry[0] if isinstance(entry, tuple) and entry else entry
+            for entry in evicted_entries
+        ]
+        agents = [
+            agent for agent in agents
+            if agent is not None and agent is not _AGENT_PENDING_SENTINEL
+        ]
+        if not agents:
             return
 
         # Don't tear down an agent that's actively mid-turn — its client,
@@ -23026,13 +23170,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for _, a in self._running_agent_items()
             if a is not None and a is not _AGENT_PENDING_SENTINEL
         }
-        if id(agent) in running_ids:
+        agents = [agent for agent in agents if id(agent) not in running_ids]
+        if not agents:
             return
+
+        def _release_all() -> None:
+            for agent in agents:
+                self._release_evicted_agent_soft(agent)
 
         try:
             threading.Thread(
-                target=self._release_evicted_agent_soft,
-                args=(agent,),
+                target=_release_all,
                 daemon=True,
                 name=f"agent-evict-{str(session_key)[:24]}",
             ).start()
@@ -23040,7 +23188,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If we can't spawn a thread (interpreter shutdown), release
             # inline as a best-effort fallback.
             try:
-                self._release_evicted_agent_soft(agent)
+                _release_all()
             except Exception:
                 pass
 
@@ -23893,8 +24041,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        user_config = _load_gateway_config()
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            from gateway.fast_head import resolve_fast_head_config
+            if resolve_fast_head_config(user_config).enabled:
+                raise ValueError("fast_head.enabled is incompatible with gateway proxy mode")
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -23914,13 +24067,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
             return self._is_session_run_current(session_key, run_generation)
         
-        user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
 
-        from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
-        agent_cfg_local = user_config.get("agent") or {}
-        disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        # Route before agent construction or toolset resolution. Malformed or
+        # disabled config fails closed to the behaviorally unchanged operator.
+        from gateway.fast_head import resolve_fast_head_config
+
+        fast_head_config = resolve_fast_head_config(user_config)
+        route_decision = self._classify_fast_head_route_for_session(
+            message,
+            enabled=fast_head_config.enabled,
+            message_type=message_type,
+            session_key=session_key,
+        )
+        if route_decision.mode == "fast_head":
+            enabled_toolsets = []
+            disabled_toolsets = None
+        else:
+            from hermes_cli.tools_config import _get_platform_tools
+            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            agent_cfg_local = user_config.get("agent") or {}
+            disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -24147,6 +24314,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_config=user_config,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
+            route_mode=route_decision.mode,
+            route_reason=route_decision.reason,
+            fast_head_config=fast_head_config,
             log_mode_enabled=log_mode_enabled,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             needs_progress_queue=needs_progress_queue,
@@ -25328,7 +25498,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # follow-up.  Use the same (session_key, session_id) the
                 # recursive call runs under so the snapshot matches exactly
                 # what the follow-up's guard will consult.  Fail-safe in helper.
-                await self._refresh_agent_cache_message_count(session_key, session_id)
+                await self._refresh_agent_cache_message_count(
+                    session_key,
+                    session_id,
+                    cache_mode=str(result.get("gateway_route") or "operator"),
+                )
 
                 followup_result = await self._run_agent(
                     message=next_message,

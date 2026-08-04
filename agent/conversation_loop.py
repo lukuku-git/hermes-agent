@@ -89,6 +89,17 @@ from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+
+def claim_fast_head_transport_call(agent) -> None:
+    """Claim one physical provider invocation from the request-scoped budget."""
+    if not getattr(agent, "_fast_head_execution", False):
+        return
+    used = int(getattr(agent, "_fast_head_transport_calls", 0) or 0)
+    budget = int(getattr(agent, "_fast_head_transport_call_budget", 1) or 1)
+    if used >= budget:
+        raise RuntimeError("Fast Head transport call budget exhausted")
+    agent._fast_head_transport_calls = used + 1
+
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
@@ -565,16 +576,17 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    if not getattr(agent, "_fast_head_execution", False):
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
@@ -1279,6 +1291,10 @@ def run_conversation(
         except Exception:
             pass
 
+    if getattr(agent, "_fast_head_execution", False):
+        agent._fast_head_transport_calls = 0
+        agent._fallback_chain = []
+
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.
@@ -1391,6 +1407,8 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        if getattr(agent, "_fast_head_execution", False):
+            raise RuntimeError("Fast Head cannot use codex_app_server")
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -1581,6 +1599,8 @@ def run_conversation(
             # It is bookkeeping, never a provider field — pop it from EVERY
             # outgoing copy.
             _api_content = api_msg.pop("api_content", None)
+            if getattr(agent, "_fast_head_execution", False):
+                _api_content = None
 
             # Display-only timeline metadata. Never a provider field — strip
             # from every outgoing copy so strict OpenAI-compatible backends
@@ -1699,7 +1719,7 @@ def run_conversation(
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
-        if moa_config:
+        if moa_config and not getattr(agent, "_fast_head_execution", False):
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
                 from agent.moa_loop import _preset_temperature, aggregate_moa_context
@@ -1769,13 +1789,14 @@ def run_conversation(
             if 0 <= current_turn_user_idx < len(messages)
             else None
         )
-        api_messages = _apply_context_engine_selection(
-            agent,
-            api_messages,
-            messages,
-            _sel_incoming,
-            logger=request_logger,
-        )
+        if not getattr(agent, "_fast_head_execution", False):
+            api_messages = _apply_context_engine_selection(
+                agent,
+                api_messages,
+                messages,
+                _sel_incoming,
+                logger=request_logger,
+            )
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
@@ -2116,7 +2137,7 @@ def run_conversation(
         
         api_start_time = time.time()
         retry_count = 0
-        max_retries = agent._api_max_retries
+        max_retries = 1 if getattr(agent, "_fast_head_execution", False) else agent._api_max_retries
         _retry = TurnRetryState()
 
         finish_reason = "stop"
@@ -2206,6 +2227,8 @@ def run_conversation(
                         api_messages,
                         tools_for_api=tools_for_api,
                     )
+                if getattr(agent, "_fast_head_execution", False):
+                    api_kwargs["tools"] = []
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -2223,35 +2246,38 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
+                _original_api_kwargs = dict(api_kwargs)
+                _llm_middleware_trace = []
+                if not getattr(agent, "_fast_head_execution", False):
+                    try:
+                        from hermes_cli.middleware import apply_llm_request_middleware
 
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
-                    _original_api_kwargs = dict(api_kwargs)
-                    _llm_middleware_trace = []
+                        _llm_request_mw = apply_llm_request_middleware(
+                            api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                        )
+                        api_kwargs = _llm_request_mw.payload
+                        _original_api_kwargs = _llm_request_mw.original_payload
+                        _llm_middleware_trace = _llm_request_mw.trace
+                    except Exception:
+                        pass
 
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
-                    if has_hook("pre_api_request"):
+                    if (not getattr(agent, "_fast_head_execution", False)
+                            and has_hook("pre_api_request")):
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -2332,7 +2358,10 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
-                _use_streaming = True
+                _use_streaming = not getattr(agent, "_fast_head_execution", False)
+                # Fast Head uses one synchronous provider attempt: the streaming
+                # adapter has its own worker/polling/fallback machinery and is
+                # therefore outside the strict no-sleep/no-recovery contract.
                 # Provider signaled "stream not supported" on a previous
                 # attempt — switch to non-streaming for the rest of this
                 # session instead of re-failing every retry.
@@ -2368,6 +2397,10 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    claim_fast_head_transport_call(agent)
+                    if getattr(agent, "_fast_head_execution", False):
+                        next_api_kwargs = dict(next_api_kwargs)
+                        next_api_kwargs["tools"] = []
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -2375,6 +2408,10 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    if getattr(agent, "_fast_head_execution", False):
+                        from agent.chat_completion_helpers import direct_api_call
+
+                        return direct_api_call(agent, next_api_kwargs)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2402,8 +2439,6 @@ def run_conversation(
                         defer_logical_completion=True,
                     )
 
-                from hermes_cli.middleware import run_llm_execution_middleware
-
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -2414,22 +2449,27 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
+                    if getattr(agent, "_fast_head_execution", False):
+                        response = _perform_api_call(api_kwargs)
+                    else:
+                        from hermes_cli.middleware import run_llm_execution_middleware
+
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -3509,6 +3549,22 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                if getattr(agent, "_fast_head_execution", False):
+                    # A Fast Head turn is one physical attempt, not the normal
+                    # recovery loop constrained by a logical-call counter.
+                    _fast_error = agent._summarize_api_error(api_error)
+                    return {
+                        "final_response": _fast_error,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "transport_calls": int(
+                            getattr(agent, "_fast_head_transport_calls", 0) or 0
+                        ),
+                        "completed": False,
+                        "failed": True,
+                        "error": _fast_error,
+                    }
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -5645,7 +5701,8 @@ def run_conversation(
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
-                if has_hook("post_api_request"):
+                if (not getattr(agent, "_fast_head_execution", False)
+                        and has_hook("post_api_request")):
                     _assistant_tool_calls = (
                         getattr(assistant_message, "tool_calls", None) or []
                     )

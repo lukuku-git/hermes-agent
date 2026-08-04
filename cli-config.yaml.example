@@ -802,6 +802,14 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Optional deterministic low-latency gateway route (default: disabled).
+  # Only obvious knowledge/explanation/opinion/comparison/casual questions use
+  # this one-call, no-tools head. Actions, current/external state, attachments,
+  # slash commands, URLs/paths, and uncertain requests stay on the full operator.
+  fast_head:
+    enabled: false
+    system_prompt: "Answer the user's question directly and concisely. Use only the conversation provided; do not claim to inspect current, external, or private state."
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.

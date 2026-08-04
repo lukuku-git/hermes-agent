@@ -893,6 +893,61 @@ class TestAgentCacheMessageCountRebaseline:
 
 
     @pytest.mark.asyncio
+    async def test_alternating_and_repeated_fast_turns_refresh_mode_aware_cache(
+        self, tmp_path
+    ):
+        """Fast and Operator share one transcript and one committed baseline."""
+        from hermes_state import SessionDB
+        from gateway.run import _build_gateway_agent_history
+
+        db = SessionDB(db_path=tmp_path / "sessions.db")
+        db.create_session("s1", source="telegram")
+        runner = self._runner_with_db(db)
+        session_key = "telegram:s1"
+        fast_key = runner._agent_cache_key(session_key, "fast_head")
+        operator_agent = object()
+        fast_agent = object()
+        initial = db.get_session("s1").get("message_count", 0)
+        with runner._agent_cache_lock:
+            runner._agent_cache[session_key] = (
+                operator_agent, "operator-sig", initial, "s1",
+            )
+            runner._agent_cache[fast_key] = (
+                fast_agent, "fast-sig", initial, "s1",
+            )
+
+        modes = ["fast_head", "operator", "fast_head", "fast_head", "operator"]
+        expected_agents = {"fast_head": fast_agent, "operator": operator_agent}
+        for idx, mode in enumerate(modes):
+            # Exercise the production pre-turn cache-hit predicate BEFORE this
+            # turn writes anything. Every warm entry must survive alternation.
+            key = runner._agent_cache_key(session_key, mode)
+            live = db.get_session("s1").get("message_count", 0)
+            with runner._agent_cache_lock:
+                cached = runner._agent_cache[key]
+            assert runner._cache_entry_matches_transcript(
+                cached, current_message_count=live, session_id="s1"
+            )
+            assert cached[0] is expected_agents[mode]
+
+            db.append_message("s1", role="user", content=f"{mode}-{idx}")
+            db.append_message("s1", role="assistant", content=f"answer-{idx}")
+            await runner._refresh_agent_cache_message_count(session_key, "s1")
+
+            committed = db.get_session("s1").get("message_count", 0)
+            history = db.get_messages("s1")
+            assert len(history) == committed
+            assert history[-2]["content"] == f"{mode}-{idx}"
+            agent_history, _ = _build_gateway_agent_history(history)
+            assert agent_history[-2]["content"] == f"{mode}-{idx}"
+            assert agent_history[-1]["content"] == f"answer-{idx}"
+            with runner._agent_cache_lock:
+                assert runner._agent_cache[session_key][0] is operator_agent
+                assert runner._agent_cache[fast_key][0] is fast_agent
+                assert runner._agent_cache[session_key][2] == committed
+                assert runner._agent_cache[fast_key][2] == committed
+
+    @pytest.mark.asyncio
     async def test_cross_process_write_still_invalidates(self, tmp_path):
         """After the re-baseline, a DIFFERENT process appending to the same
         session must still flip the guard to rebuild (the #45966 fix holds).

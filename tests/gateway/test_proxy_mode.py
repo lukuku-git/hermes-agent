@@ -165,6 +165,22 @@ class TestRunAgentProxyDispatch:
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
 
+    @pytest.mark.asyncio
+    async def test_enabled_fast_head_rejects_proxy_before_forwarding(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner._run_agent_via_proxy = AsyncMock()
+        source = _make_source()
+        config = {"agent": {"fast_head": {"enabled": True}}}
+
+        with patch("gateway.run._load_gateway_config", return_value=config):
+            with pytest.raises(ValueError, match="fast_head.enabled"):
+                await runner._run_agent(
+                    message="Why is the sky blue?", context_prompt="", history=[],
+                    source=source, session_id="s", session_key="k",
+                )
+        runner._run_agent_via_proxy.assert_not_called()
+
 
 class TestRunAgentViaProxy:
     """Test the actual proxy HTTP forwarding logic."""

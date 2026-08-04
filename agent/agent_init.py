@@ -445,6 +445,43 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _load_initial_tools(
+    *,
+    tool_free: bool,
+    loader,
+    enabled_toolsets: List[str] | None,
+    disabled_toolsets: List[str] | None,
+    quiet_mode: bool,
+):
+    """Load the frozen tool schema, or bypass discovery for a tool-free head."""
+    if tool_free:
+        return []
+    return loader(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=quiet_mode,
+    )
+
+
+class _FastHeadContextCompressor:
+    """No-op compressor surface for a head that must never probe or compact."""
+
+    name = "fast_head_disabled"
+    context_length = 0
+    threshold_tokens = 0
+    protect_first_n = 0
+    protect_last_n = 0
+    awaiting_real_usage_after_compression = False
+    _context_probed = False
+    _context_probe_persistable = False
+
+    def update_from_response(self, _usage):
+        return None
+
+    def get_tool_schemas(self):
+        return []
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -507,6 +544,8 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    fast_head_system_prompt: str = None,
+    tool_free: bool = False,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -598,6 +637,11 @@ def init_agent(
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
+    agent._fast_head_system_prompt = fast_head_system_prompt
+    agent._tool_free = tool_free
+    agent._fast_head_execution = bool(fast_head_system_prompt)
+    agent._fast_head_transport_call_budget = 1 if agent._fast_head_execution else None
+    agent._fast_head_transport_calls = 0
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -894,7 +938,7 @@ def init_agent(
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
     # byte-identical to a parent for provider cache parity.
-    agent._skip_mcp_refresh = False
+    agent._skip_mcp_refresh = bool(tool_free)
     # Registry generation the current tool snapshot was derived from. Lets a
     # late/concurrent refresh reject a stale (older-generation) rebuild instead
     # of clobbering a newer one. Set adjacent to the tool snapshot below.
@@ -1416,7 +1460,9 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
+    agent.tools = _load_initial_tools(
+        tool_free=tool_free,
+        loader=_ra().get_tool_definitions,
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
@@ -2350,9 +2396,11 @@ def init_agent(
     # AFTER the custom_providers branch so per-model overrides aren't lost.
     agent._config_context_length = _config_context_length
 
-    _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
-        _config_context_length
-    )
+    _lmstudio_runtime_context_length = None
+    if not agent._fast_head_execution:
+        _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
+            _config_context_length
+        )
     if agent._lmstudio_load_was_unverified(_lmstudio_runtime_context_length):
         _ra().logger.warning(
             "LM Studio model activation was rejected or completed without a "
@@ -2379,7 +2427,7 @@ def init_agent(
     except Exception:
         pass
 
-    if _engine_name != "compressor":
+    if _engine_name != "compressor" and not agent._fast_head_execution:
         # Try loading from plugins/context_engine/<name>/
         try:
             from plugins.context_engine import load_context_engine
@@ -2424,7 +2472,9 @@ def init_agent(
             )
     # else: config says "compressor" — use built-in, don't auto-activate plugins
 
-    if _selected_engine is not None:
+    if agent._fast_head_execution:
+        agent.context_compressor = _FastHeadContextCompressor()
+    elif _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy: the host compression
         # threshold (including the Codex gpt-5.5 autoraise above) only
@@ -2491,7 +2541,7 @@ def init_agent(
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
         except Exception:
             pass
-    agent.compression_enabled = compression_enabled
+    agent.compression_enabled = compression_enabled and not agent._fast_head_execution
     agent.compression_in_place = compression_in_place
     # Apply micro-compaction settings to the compressor (feature is opt-in)
     _cc = getattr(agent, "context_compressor", None)

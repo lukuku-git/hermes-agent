@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import MagicMock, patch
@@ -446,8 +447,8 @@ def wire_env():
     db = SessionDB(db_path=Path(test_home) / "state.db")
     sid = "sess-wire"
 
-    def make_agent():
-        agent = AIAgent(
+    def make_agent(**overrides):
+        kwargs = dict(
             api_key="test-key", base_url=f"http://127.0.0.1:{port}/v1",
             provider="openai-compat", model="test-model",
             max_iterations=10, enabled_toolsets=[],
@@ -455,7 +456,10 @@ def wire_env():
             save_trajectories=False, platform="cli",
             session_db=db, session_id=sid,
         )
-        agent.valid_tool_names = {"read_file"}
+        kwargs.update(overrides)
+        agent = AIAgent(**kwargs)
+        if not kwargs.get("tool_free"):
+            agent.valid_tool_names = {"read_file"}
         return agent
 
     try:
@@ -487,6 +491,221 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    def test_operator_transport_calls_match_logical_and_physical_requests(self, wire_env):
+        make_agent, handler, _db, _sid = wire_env
+        agent = make_agent()
+        handler.response_queue.append(_text_resp("operator answer"))
+
+        result = agent.run_conversation(
+            "answer normally", conversation_history=[], task_id="operator-count"
+        )
+
+        assert len(_chat_requests(handler)) == 1
+        assert result["api_calls"] == 1
+        assert result["transport_calls"] == 1
+
+    def test_first_fast_turn_is_exactly_one_total_provider_request(self, wire_env):
+        make_agent, handler, _db, _sid = wire_env
+        agent = make_agent(
+            fast_head_system_prompt="FAST-SYSTEM",
+            tool_free=True,
+            max_iterations=1,
+        )
+        handler.response_queue.append(_text_resp("answer"))
+
+        result = agent.run_conversation(
+            "Why is the sky blue?", conversation_history=[], task_id="one-physical"
+        )
+
+        assert len(handler.captured_requests) == 1
+        assert len(_chat_requests(handler)) == 1
+        assert result["transport_calls"] == 1
+
+    def test_fast_head_bypasses_all_llm_request_middleware(self, wire_env, monkeypatch):
+        make_agent, handler, _db, _sid = wire_env
+        calls = []
+
+        def inject(request, **_context):
+            calls.append("llm_request_middleware")
+            changed = dict(request)
+            changed["messages"] = list(changed.get("messages") or []) + [{
+                "role": "user", "content": "PLUGIN_REQUEST_MIDDLEWARE_PRIVATE_MARKER",
+            }]
+            return types.SimpleNamespace(
+                payload=changed,
+                original_payload=request,
+                changed=True,
+                trace=[{"source": "adversarial"}],
+            )
+
+        def lifecycle_hook(hook_name, **kwargs):
+            if hook_name != "pre_api_request":
+                return []
+            calls.append("pre_api_request")
+            request_messages = kwargs.get("request_messages") or []
+            request_messages.append({
+                "role": "user", "content": "LIFECYCLE_REQUEST_PRIVATE_MARKER",
+            })
+            return []
+
+        monkeypatch.setattr("hermes_cli.middleware.apply_llm_request_middleware", inject)
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "pre_api_request")
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lifecycle_hook)
+        agent = make_agent(
+            fast_head_system_prompt="FAST-SYSTEM",
+            tool_free=True,
+            max_iterations=1,
+        )
+        handler.response_queue.append(_text_resp("answer"))
+
+        agent.run_conversation(
+            "Why is the sky blue?", conversation_history=[], task_id="no-middleware"
+        )
+
+        payload = json.dumps(_chat_requests(handler)[0], sort_keys=True)
+        assert calls == []
+        assert "PLUGIN_REQUEST_MIDDLEWARE_PRIVATE_MARKER" not in payload
+        assert "LIFECYCLE_REQUEST_PRIVATE_MARKER" not in payload
+
+    def test_fast_head_skips_all_lifecycle_output_and_session_hooks(
+        self, wire_env, monkeypatch
+    ):
+        make_agent, handler, _db, _sid = wire_env
+        hooks = []
+
+        def lifecycle_hook(hook_name, **_kwargs):
+            hooks.append(hook_name)
+            if hook_name == "transform_llm_output":
+                return ["PLUGIN_TRANSFORMED_OUTPUT"]
+            return []
+
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda _name: True)
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lifecycle_hook)
+        agent = make_agent(
+            fast_head_system_prompt="FAST-SYSTEM",
+            tool_free=True,
+            max_iterations=1,
+        )
+        handler.response_queue.append(_text_resp("provider answer"))
+
+        result = agent.run_conversation(
+            "Why is the sky blue?", conversation_history=[], task_id="no-hooks"
+        )
+
+        assert result["final_response"] == "provider answer"
+        assert hooks == []
+
+    def test_fast_head_transport_exception_has_no_recovery_retry_or_sleep(
+        self, wire_env, monkeypatch
+    ):
+        make_agent, handler, _db, _sid = wire_env
+        agent = make_agent(
+            fast_head_system_prompt="FAST-SYSTEM",
+            tool_free=True,
+            max_iterations=1,
+        )
+        calls = []
+
+        def disconnect(request_handler):
+            length = int(request_handler.headers.get("Content-Length", 0))
+            request = json.loads(request_handler.rfile.read(length).decode())
+            type(request_handler).captured_requests.append(request)
+            calls.append("transport")
+            request_handler.connection.close()
+
+        monkeypatch.setattr(_MockHandler, "do_POST", disconnect)
+        monkeypatch.setattr(
+            agent, "_try_recover_primary_transport",
+            lambda *_a, **_k: calls.append("recover") or True,
+        )
+        monkeypatch.setattr(
+            agent, "_try_activate_fallback",
+            lambda *_a, **_k: calls.append("fallback") or True,
+        )
+        monkeypatch.setattr(
+            agent, "_has_pending_fallback",
+            lambda *_a, **_k: calls.append("pending_fallback") or True,
+        )
+        class _ConversationLoopTimeSpy:
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+            def sleep(self, *_args, **_kwargs):
+                calls.append("sleep")
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.time",
+            _ConversationLoopTimeSpy(),
+        )
+
+        result = agent.run_conversation(
+            "Why is the sky blue?", conversation_history=[], task_id="disconnect"
+        )
+
+        assert calls == ["transport"]
+        assert len(handler.captured_requests) == 1
+        assert result["failed"] is True
+        assert result["transport_calls"] == 1
+
+    def test_fast_head_wire_has_one_call_no_tools_or_nonconversation_context(self, wire_env):
+        make_agent, handler, _db, _sid = wire_env
+        agent = make_agent(
+            fast_head_system_prompt="FAST-SYSTEM",
+            tool_free=True,
+            max_iterations=1,
+        )
+        engine_calls = []
+
+        def _select(*_args, **_kwargs):
+            engine_calls.append(True)
+            return [{"role": "user", "content": "ENGINE_MARKER"}]
+
+        agent.context_compressor.select_context = _select
+        agent._gateway_turn_context_notes = ["SIDECAR_MARKER"]
+        history = [{
+            "role": "user",
+            "content": "clean prior turn",
+            "api_content": "clean prior turn\n\nHISTORICAL_PRIVATE_MARKER",
+        }, {"role": "assistant", "content": "prior answer"}]
+        handler.response_queue.append(_text_resp("fast answer"))
+
+        result = agent.run_conversation(
+            "Why is the sky blue?", conversation_history=history, task_id="fast"
+        )
+
+        requests = _chat_requests(handler)
+        assert len(requests) == 1
+        assert requests[0]["tools"] == []
+        payload = json.dumps(requests[0], sort_keys=True)
+        for marker in (
+            "PLUGIN-CTX", "ENGINE_MARKER", "SIDECAR_MARKER",
+            "HISTORICAL_PRIVATE_MARKER",
+        ):
+            assert marker not in payload
+        assert engine_calls == []
+        assert result["api_calls"] == 1
+        assert result["transport_calls"] == 1
+
+    def test_fast_head_tool_call_response_does_not_trigger_summary_or_second_call(self, wire_env):
+        make_agent, handler, _db, _sid = wire_env
+        agent = make_agent(
+            fast_head_system_prompt="FAST-SYSTEM",
+            tool_free=True,
+            max_iterations=1,
+        )
+        agent._handle_max_iterations = lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("summary fallback must not run")
+        )
+        handler.response_queue.append(_tc_resp("read_file", "{}"))
+
+        result = agent.run_conversation(
+            "Explain photosynthesis", conversation_history=[], task_id="fast-tool"
+        )
+
+        assert len(_chat_requests(handler)) == 1
+        assert result["api_calls"] == 1
+        assert result["transport_calls"] == 1
+
     def test_injection_sent_stamped_and_stable_within_turn(self, wire_env):
         """The current turn's user message goes out with the injected context,
         the sidecar equals the sent bytes exactly, the field never reaches the
@@ -497,10 +716,12 @@ class TestWireInvariant:
         handler.response_queue.append(_tc_resp("read_file", '{"file_path": "/nonexistent-path"}'))
         handler.response_queue.append(_text_resp("done"))
 
-        agent.run_conversation("hello please", conversation_history=[], task_id="t")
+        result = agent.run_conversation("hello please", conversation_history=[], task_id="t")
 
         reqs = _chat_requests(handler)
         assert len(reqs) == 2
+        assert result["api_calls"] == len(reqs)
+        assert result["transport_calls"] == len(reqs)
         sent_1 = _user_messages(reqs[0])[0]["content"]
         sent_2 = _user_messages(reqs[1])[0]["content"]
         assert sent_1 == "hello please\n\nPLUGIN-CTX"

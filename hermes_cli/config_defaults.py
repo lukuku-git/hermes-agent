@@ -30,6 +30,18 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 500,
+        # Optional deterministic gateway split. Disabled by default: only
+        # obvious self-contained conversational questions use a one-call,
+        # tool-free agent with this byte-stable prompt; uncertain/action/current
+        # requests retain the normal operator path.
+        "fast_head": {
+            "enabled": False,
+            "system_prompt": (
+                "Answer the user's question directly and concisely. Use only the "
+                "conversation provided; do not claim to inspect current, external, "
+                "or private state."
+            ),
+        },
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

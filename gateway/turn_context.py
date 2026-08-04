@@ -94,6 +94,9 @@ class TurnContext:
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
+    route_mode: str = "operator"
+    route_reason: str = "disabled"
+    fast_head_config: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False

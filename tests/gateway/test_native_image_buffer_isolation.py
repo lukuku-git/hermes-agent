@@ -94,3 +94,26 @@ async def test_native_image_buffer_uses_resolved_session_key_when_provided():
 
     assert runner._consume_pending_native_image_paths("source-derived-key") == []
     assert runner._consume_pending_native_image_paths("canonical-session-key") == ["/tmp/a.png"]
+
+
+@pytest.mark.asyncio
+async def test_native_image_buffer_forces_fast_head_to_operator_before_consumption():
+    runner = _make_runner()
+    source = _source("chat-fast")
+    session_key = build_session_key(source)
+    await runner._prepare_inbound_message_text(
+        event=_image_event(source, "/tmp/native.png"),
+        source=source,
+        history=[],
+        session_key=session_key,
+    )
+
+    decision = runner._classify_fast_head_route_for_session(
+        "What does this mean?",
+        enabled=True,
+        message_type=MessageType.TEXT,
+        session_key=session_key,
+    )
+    assert decision.mode == "operator"
+    assert decision.reason == "media"
+    assert runner._consume_pending_native_image_paths(session_key) == ["/tmp/native.png"]

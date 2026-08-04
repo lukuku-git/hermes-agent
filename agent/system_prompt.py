@@ -167,6 +167,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     session — that's the only way to keep upstream prompt caches
     warm across turns.
     """
+    fast_head_prompt = getattr(agent, "_fast_head_system_prompt", None)
+    if fast_head_prompt is not None:
+        return {"stable": fast_head_prompt, "context": "", "volatile": ""}
+
     # Local import to avoid pulling model_tools at module load.  Tests
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
