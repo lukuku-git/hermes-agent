@@ -255,7 +255,6 @@ def test_runtime_that_cannot_honor_fast_boundaries_routes_operator():
     {"api_mode": "chat_completions", "provider": "custom"},
     {"api_mode": "anthropic_messages", "provider": "openai"},
     {"api_mode": "codex_responses", "provider": "openrouter"},
-    {"api_mode": "codex_responses", "provider": "openai-codex"},
 ])
 def test_unresolved_malformed_or_unapproved_runtime_fails_closed(runtime):
     from gateway.fast_head import constrain_fast_head_route_for_runtime
@@ -271,6 +270,11 @@ def test_unresolved_malformed_or_unapproved_runtime_fails_closed(runtime):
     {"api_mode": "chat_completions", "provider": "openrouter"},
     {"api_mode": "chat_completions", "provider": "nous"},
     {"api_mode": "anthropic_messages", "provider": "anthropic"},
+    {
+        "api_mode": "codex_responses",
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+    },
 ])
 def test_only_explicitly_approved_resolved_runtime_pairs_remain_fast(runtime):
     from gateway.fast_head import constrain_fast_head_route_for_runtime
@@ -279,25 +283,40 @@ def test_only_explicitly_approved_resolved_runtime_pairs_remain_fast(runtime):
     assert constrain_fast_head_route_for_runtime(decision, runtime).mode == "fast_head"
 
 
-def test_codex_connect_error_runtime_is_downgraded_before_any_fast_request():
-    import httpx
-
+def test_codex_responses_runtime_remains_fast_when_single_attempt_is_enforced():
     from gateway.fast_head import constrain_fast_head_route_for_runtime
 
-    fast_requests = []
     decision = constrain_fast_head_route_for_runtime(
         classify_fast_head_route("Why is the sky blue?"),
-        {"api_mode": "codex_responses", "provider": "openai-codex"},
+        {
+            "api_mode": "codex_responses",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        },
     )
+    assert decision.mode == "fast_head"
 
-    def dispatch(route):
-        if route.mode == "fast_head":
-            fast_requests.append(True)
-            raise httpx.ConnectError("adversarial first attempt")
-        return "operator"
 
-    assert dispatch(decision) == "operator"
-    assert fast_requests == []
+@pytest.mark.parametrize("base_url", [
+    None,
+    "",
+    "https://attacker.example/v1",
+    "http://chatgpt.com/backend-api/codex",
+    "https://chatgpt.com.evil.example/backend-api/codex",
+    "https://chatgpt.com/backend-api/codex?proxy=1",
+])
+def test_codex_responses_fast_requires_exact_canonical_endpoint(base_url):
+    from gateway.fast_head import constrain_fast_head_route_for_runtime
+
+    decision = constrain_fast_head_route_for_runtime(
+        classify_fast_head_route("Why is the sky blue?"),
+        {
+            "api_mode": "codex_responses",
+            "provider": "openai-codex",
+            "base_url": base_url,
+        },
+    )
+    assert decision.mode == "operator"
 
 
 def test_slash_commands_urls_paths_and_media_route_operator():

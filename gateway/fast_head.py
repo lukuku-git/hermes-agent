@@ -144,9 +144,15 @@ def constrain_fast_head_route_for_runtime(
         ("chat_completions", "openrouter"),
         ("chat_completions", "nous"),
         ("anthropic_messages", "anthropic"),
+        ("codex_responses", "openai-codex"),
     }
     if (moa_active or (api_mode, provider) not in approved_runtime_pairs
             or base_url.startswith(("acp://", "acp+tcp://"))):
+        return RouteDecision("operator", "unsupported_runtime")
+    if (
+        (api_mode, provider) == ("codex_responses", "openai-codex")
+        and base_url != "https://chatgpt.com/backend-api/codex"
+    ):
         return RouteDecision("operator", "unsupported_runtime")
     return decision
 

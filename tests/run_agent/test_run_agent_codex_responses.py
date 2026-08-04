@@ -218,6 +218,25 @@ def _codex_final_answer_with_top_level_incomplete_response(text: str):
     )
 
 
+def test_fast_head_codex_connect_error_is_one_physical_attempt(monkeypatch):
+    import httpx
+
+    agent = _build_agent(monkeypatch)
+    agent._fast_head_execution = True
+    attempts = []
+
+    def create(**kwargs):
+        attempts.append(dict(kwargs))
+        raise httpx.ConnectError("adversarial first attempt")
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    with pytest.raises(httpx.ConnectError):
+        agent._run_codex_stream({"model": "gpt-5-codex", "input": "hi"}, client=client)
+
+    assert len(attempts) == 1
+    assert attempts[0]["stream"] is True
+
+
 class _FakeCreateStream:
     """Iterable-only fake for ``responses.create(stream=True)`` outputs.
 
