@@ -1284,6 +1284,16 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     session to spin up its own container.  Only overrides containing
     backend-specific image keys or ``env_type`` trigger isolation.
     """
+    # A delegate runs untrusted review/test commands in the same Hermes
+    # process as its parent.  Never reuse the parent's persistent shell:
+    # exports, cwd changes, virtualenv activation, and shell options would
+    # otherwise survive the review and corrupt later parent measurements.
+    if task_id:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        if is_delegated_child_process_context():
+            return task_id
+
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",

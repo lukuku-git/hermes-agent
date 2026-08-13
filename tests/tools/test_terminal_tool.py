@@ -30,6 +30,24 @@ def test_terminal_schema_advertises_persistent_env_state():
     assert "once per session" in description
 
 
+def test_delegated_child_gets_isolated_terminal_environment(monkeypatch):
+    monkeypatch.setattr(
+        "agent.delegation_context.is_delegated_child_process_context",
+        lambda: True,
+    )
+
+    assert terminal_tool._resolve_container_task_id("review-child") == "review-child"
+
+
+def test_parent_keeps_shared_terminal_environment(monkeypatch):
+    monkeypatch.setattr(
+        "agent.delegation_context.is_delegated_child_process_context",
+        lambda: False,
+    )
+
+    assert terminal_tool._resolve_container_task_id("parent-session") == "default"
+
+
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
