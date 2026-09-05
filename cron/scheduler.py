@@ -215,12 +215,7 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """Resolve the toolset list for a cron job.
 
-    Employee-owned jobs are a separate trust class. Presence of the immutable
-    ``employee_owner`` marker makes their stored allowlist fail closed to the
-    employee-safe toolsets: no platform defaults, MCP merge, or hand-edited
-    core toolset can widen an unattended employee run.
-
-    Precedence for ordinary jobs:
+    Precedence:
     1. Per-job ``enabled_toolsets`` (set via ``cronjob`` tool on create/update).
        Keeps the agent's job-scoped toolset override intact — #6130. Enabled
        MCP servers are layered on per ``_merge_mcp_into_per_job_toolsets`` so a
@@ -236,17 +231,6 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     get cron WITHOUT ``moa`` by default (issue reported by Norbert —
     surprise $4.63 run).
     """
-    if "employee_owner" in job:
-        from tools.company_self_service import SAFE_CRON_TOOLSETS
-
-        per_job = job.get("enabled_toolsets")
-        if not isinstance(per_job, list):
-            return []
-        return [
-            name for name in per_job
-            if isinstance(name, str) and name in SAFE_CRON_TOOLSETS
-        ]
-
     per_job = job.get("enabled_toolsets")
     if per_job:
         return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
@@ -2777,28 +2761,6 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
-def _employee_cron_identity(job: dict) -> Optional[dict[str, str]]:
-    """Validate and return immutable stored employee-owner provenance.
-
-    Presence of ``employee_owner`` is authoritative: malformed provenance is a
-    hard failure, never a reason to downgrade the job into the ordinary cron
-    trust class or to authenticate from mutable delivery ``origin`` metadata.
-    """
-    if "employee_owner" not in job:
-        return None
-    owner = job.get("employee_owner")
-    if not isinstance(owner, dict):
-        raise RuntimeError("Employee cron job has invalid stored owner provenance")
-    identity = {
-        "user_id": str(owner.get("user_id") or "").strip(),
-        "chat_id": str(owner.get("channel_id") or "").strip(),
-        "thread_id": str(owner.get("thread_id") or "").strip(),
-    }
-    if not all(identity.values()):
-        raise RuntimeError("Employee cron job has incomplete stored owner provenance")
-    return identity
-
-
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -3062,12 +3024,11 @@ def run_job(
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
 
     # Cron execution is an internal scheduler context, not a live inbound
-    # gateway message. Ordinary jobs therefore do not seed HERMES_SESSION_*
-    # from stored ``origin`` (delivery routing metadata is not identity).
-    # Employee-owned jobs are the deliberate exception: their immutable
-    # ``employee_owner`` provenance is validated and rebound below as a
-    # non-admin Slack principal for owner-scoped reads and tool authorization.
-    # Several tool consumers branch on these vars during job execution:
+    # gateway message. Do not seed HERMES_SESSION_* contextvars from the
+    # stored ``origin`` (which is delivery routing metadata, not a sender
+    # identity). Several tool consumers branch on these vars during job
+    # execution and would otherwise behave as if a real user from the
+    # origin chat was driving the agent:
     #   - tools/terminal_tool.py: background-process notification routing
     #     (notify_on_complete / watch_patterns) reads HERMES_SESSION_PLATFORM
     #     and HERMES_SESSION_CHAT_ID to populate watcher_platform / chat_id,
@@ -3095,19 +3056,10 @@ def run_job(
         )
         _job_workdir = None
 
-    _employee_identity = _employee_cron_identity(job)
     _ctx_tokens = set_session_vars(
-        # Ordinary cron runs bind no sender identity. Employee-owned runs bind
-        # only their immutable stored owner provenance so scoped context reads
-        # and the execution-time safe-tool gate see the original principal.
-        platform="slack" if _employee_identity else "",
-        source="cron" if _employee_identity else "",
-        chat_id=_employee_identity["chat_id"] if _employee_identity else "",
+        platform="",
+        chat_id="",
         chat_name="",
-        thread_id=_employee_identity["thread_id"] if _employee_identity else "",
-        user_id=_employee_identity["user_id"] if _employee_identity else "",
-        message_id=_employee_identity["thread_id"] if _employee_identity else "",
-        session_id=_cron_session_id,
         # A cron job cannot receive a completion after its turn ends. We clear the
         # HERMES_SESSION_* routing keys just below, so an async delegation's
         # completion event carries session_key="" — _enrich_async_delegation_routing
