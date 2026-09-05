@@ -368,9 +368,7 @@ def _jobs_lock():
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({
-    "id", "employee_owner", "employee_audit", "employee_removed_at"
-})
+_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1263,10 +1261,6 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
-    employee_owner: Optional[Dict[str, str]] = None,
-    employee_expected_owner: Optional[str] = None,
-    employee_audit_event: Optional[Dict[str, Any]] = None,
-    employee_max_active: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1433,13 +1427,6 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
-    # Core-only employee ownership metadata is persisted in the same locked
-    # atomic jobs.json write as the job. Keep ordinary operator jobs byte-shape
-    # compatible by omitting the field when not supplied.
-    if employee_owner:
-        job["employee_owner"] = copy.deepcopy(employee_owner)
-        if employee_audit_event is not None:
-            job["employee_audit"] = [copy.deepcopy(employee_audit_event)]
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1448,24 +1435,8 @@ def create_job(
 
     with _jobs_lock():
         jobs = load_jobs()
-        if employee_expected_owner is not None:
-            actual_owner = str((job.get("employee_owner") or {}).get("user_id") or "")
-            if not actual_owner or actual_owner != str(employee_expected_owner):
-                raise PermissionError("employee cron owner does not match trusted principal")
-            if employee_audit_event is None:
-                raise ValueError("employee cron mutation requires in-record audit metadata")
-            if employee_max_active is not None:
-                active = sum(
-                    1 for existing in jobs
-                    if str((existing.get("employee_owner") or {}).get("user_id") or "") == actual_owner
-                    and existing.get("enabled", True)
-                    and existing.get("state") not in {"removed", "completed"}
-                    and not existing.get("employee_removed_at")
-                )
-                if active >= int(employee_max_active):
-                    raise ValueError("active cron quota reached")
         jobs.append(job)
-        _save_jobs_unlocked(jobs)
+        save_jobs(jobs)
 
     return job
 
@@ -1533,14 +1504,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(
-    job_id: str,
-    updates: Dict[str, Any],
-    *,
-    employee_expected_owner: Optional[str] = None,
-    employee_audit_event: Optional[Dict[str, Any]] = None,
-    employee_max_active: Optional[int] = None,
-) -> Optional[Dict[str, Any]]:
+def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
@@ -1556,27 +1520,6 @@ def update_job(
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
-
-            if employee_expected_owner is not None:
-                actual_owner = str((job.get("employee_owner") or {}).get("user_id") or "")
-                if not actual_owner or actual_owner != str(employee_expected_owner):
-                    raise PermissionError("cron job is not owned by the trusted principal")
-                if employee_audit_event is None:
-                    raise ValueError("employee cron mutation requires in-record audit metadata")
-                resuming = bool(updates.get("enabled")) and (
-                    not job.get("enabled", True) or job.get("state") in {"paused", "removed"}
-                )
-                if resuming and employee_max_active is not None:
-                    active = sum(
-                        1 for existing in jobs
-                        if existing.get("id") != job_id
-                        and str((existing.get("employee_owner") or {}).get("user_id") or "") == actual_owner
-                        and existing.get("enabled", True)
-                        and existing.get("state") not in {"removed", "completed"}
-                        and not existing.get("employee_removed_at")
-                    )
-                    if active >= int(employee_max_active):
-                        raise ValueError("active cron quota reached")
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).
@@ -1656,84 +1599,10 @@ def update_job(
                     )
                 updated["next_run_at"] = next_run
 
-            if employee_expected_owner is not None:
-                updated["employee_audit"] = [
-                    *copy.deepcopy(job.get("employee_audit") or []),
-                    copy.deepcopy(employee_audit_event),
-                ]
-
             jobs[i] = updated
-            _save_jobs_unlocked(jobs)
+            save_jobs(jobs)
             return _normalize_job_record(jobs[i])
     return None
-
-
-def mutate_employee_job(
-    job_id: str,
-    *,
-    expected_owner: str,
-    action: str,
-    audit_event: Dict[str, Any],
-    updates: Optional[Dict[str, Any]] = None,
-    max_active: int = 5,
-) -> Optional[Dict[str, Any]]:
-    """Atomically authorize, audit, and mutate one employee-owned job.
-
-    The trusted wrapper supplies ``expected_owner``; ownership is rechecked
-    against storage while holding the jobs lock. Every successful mutation is
-    persisted in the same atomic jobs.json write as its immutable audit event.
-    """
-    if not expected_owner or not isinstance(audit_event, dict) or not audit_event:
-        raise ValueError("trusted owner and audit event are required")
-    action = str(action or "").lower()
-    with _jobs_lock():
-        jobs = load_jobs()
-        job = next((j for j in jobs if j.get("id") == job_id), None)
-        if job is None:
-            return None
-        actual_owner = str((job.get("employee_owner") or {}).get("user_id") or "")
-        if actual_owner != str(expected_owner):
-            raise PermissionError("cron job is not owned by the trusted principal")
-        if job.get("employee_removed_at") or job.get("state") == "removed":
-            return None
-
-        if action == "remove":
-            job["enabled"] = False
-            job["state"] = "removed"
-            job["next_run_at"] = None
-            job["employee_removed_at"] = _hermes_now().isoformat()
-            job["employee_audit"] = [
-                *copy.deepcopy(job.get("employee_audit") or []),
-                copy.deepcopy(audit_event),
-            ]
-            _save_jobs_unlocked(jobs)
-            return _normalize_job_record(job)
-
-        mutation = dict(updates or {})
-        if action == "pause":
-            mutation.update({
-                "enabled": False, "state": "paused",
-                "paused_at": _hermes_now().isoformat(),
-                "paused_reason": "employee request",
-            })
-        elif action == "resume":
-            next_run_at = compute_next_run(job["schedule"])
-            if next_run_at is None and job["schedule"].get("kind") == "once":
-                raise ValueError("cannot resume an expired one-shot job")
-            mutation.update({
-                "enabled": True, "state": "scheduled", "paused_at": None,
-                "paused_reason": None, "next_run_at": next_run_at,
-            })
-        elif action != "update":
-            raise ValueError("unsupported employee cron mutation")
-
-        return update_job(
-            job_id,
-            mutation,
-            employee_expected_owner=expected_owner,
-            employee_audit_event=audit_event,
-            employee_max_active=max_active,
-        )
 
 
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:

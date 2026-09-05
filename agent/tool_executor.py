@@ -411,19 +411,6 @@ def _run_agent_tool_execution_middleware(
         block_message = scope_block
         block_error_type = "tool_scope_block"
         if block_message is None:
-            # Built-in employee boundary runs before extensible plugin hooks so
-            # natural-language dispatch, deferred tool_call unwrapping, and
-            # concurrent execution all receive the same owner policy.
-            try:
-                from tools.company_self_service import generic_slack_tool_block
-                block_message = generic_slack_tool_block(function_name, final_args)
-            except Exception:
-                # A Slack identity was not necessarily present; the employee
-                # tool itself independently fails closed on missing identity.
-                block_message = None
-            if block_message is not None:
-                block_error_type = "employee_scope_block"
-        if block_message is None:
             block_error_type = "plugin_block"
 
             def _resolve_pre_tool_block():
