@@ -231,6 +231,18 @@ def test_generic_mutation_bypass_is_blocked_only_for_bound_slack():
     assert css.generic_slack_tool_block("memory", {"action": "add"}) is None
 
 
+def test_employee_cron_execution_gate_denies_everything_outside_safe_tools():
+    set_session_vars(
+        platform="slack", source="cron", user_id="UA", chat_id="CA",
+        thread_id="TA", message_id="TA", cron_session="1", is_admin=True,
+    )
+    for tool in css.SAFE_CRON_TOOLS:
+        assert css.generic_slack_tool_block(tool, {}) is None
+    for tool in ("memory", "skill_manage", "cronjob", "company_self_service",
+                 "terminal", "write_file", "execute_code", "delegate_task"):
+        assert css.generic_slack_tool_block(tool, {})
+
+
 def test_common_dispatch_blocks_natural_language_and_internal_bypass():
     bind()
     from model_tools import handle_function_call

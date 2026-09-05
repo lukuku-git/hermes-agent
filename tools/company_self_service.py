@@ -24,6 +24,10 @@ MAX_SKILL_CHARS = 24000
 MAX_PROMPT_CHARS = 6000
 MAX_ACTIVE_CRON = 5
 SAFE_CRON_TOOLSETS = frozenset({"web", "search", "vision"})
+# Execution-time allowlist for employee-owned cron jobs. Toolset filtering is
+# only the schema boundary; this name-level gate is the authorization boundary
+# and also covers deferred/tool_call dispatch and future core-tool additions.
+SAFE_CRON_TOOLS = frozenset({"web_search", "web_extract", "vision_analyze"})
 _SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SPOOF_FIELDS = frozenset({"owner", "owner_id", "user_id", "author", "author_id", "approver", "approver_id", "principal"})
 
@@ -557,13 +561,28 @@ def employee_context_for_turn() -> str:
 
 
 def generic_slack_tool_block(name: str, args: dict[str, Any]) -> Optional[str]:
-    """Central natural-language dispatch policy for generic mutation bypasses."""
-    from gateway.session_context import trusted_session_identity, trusted_session_is_admin
+    """Central natural-language and employee-cron tool authorization policy."""
+    from gateway.session_context import (
+        get_session_env,
+        trusted_session_identity,
+        trusted_session_is_admin,
+    )
     ident = trusted_session_identity()
-    if not ident or ident.get("platform", "").lower() != "slack" or trusted_session_is_admin():
+    if not ident or ident.get("platform", "").lower() != "slack":
         return None
-    action = str(args.get("action") or "").lower()
-    if name == "memory" or name == "skill_manage" or name == "cronjob":
+
+    # A stored employee owner is rebound by the scheduler for the duration of
+    # its run. Cron is unattended, so enforce the employee safe set by concrete
+    # tool name here, after deferred tool_call unwrapping and before plugins or
+    # dispatch. Admin status cannot widen an employee-owned scheduled job.
+    if get_session_env("HERMES_CRON_SESSION", "") == "1":
+        if name not in SAFE_CRON_TOOLS:
+            return "Employee cron jobs may use only approved read-only tools"
+        return None
+
+    if trusted_session_is_admin():
+        return None
+    if name in {"memory", "skill_manage", "cronjob"}:
         return "Slack employees must use company_self_service for owner-scoped operations"
     return None
 

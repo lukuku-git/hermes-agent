@@ -9,9 +9,35 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _employee_cron_identity
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+class TestEmployeeCronExecutionPolicy:
+    def test_stored_toolsets_are_intersected_without_mcp_or_platform_widening(self):
+        job = {
+            "employee_owner": {"user_id": "U1", "channel_id": "C1", "thread_id": "T1"},
+            "enabled_toolsets": ["web", "terminal", "vision", "evil_mcp"],
+        }
+        assert _resolve_cron_enabled_toolsets(job, {"mcp_servers": {"evil_mcp": {"enabled": True}}}) == ["web", "vision"]
+
+    @pytest.mark.parametrize("enabled", [None, "web", {"web"}, {"web": True}])
+    def test_malformed_employee_allowlist_fails_closed(self, enabled):
+        job = {"employee_owner": {}, "enabled_toolsets": enabled}
+        assert _resolve_cron_enabled_toolsets(job, {}) == []
+
+    def test_owner_provenance_comes_only_from_immutable_employee_record(self):
+        job = {
+            "employee_owner": {"user_id": "U1", "channel_id": "C1", "thread_id": "T1"},
+            "origin": {"platform": "slack", "user_id": "ATTACKER", "chat_id": "OTHER", "thread_id": "OTHER"},
+        }
+        assert _employee_cron_identity(job) == {"user_id": "U1", "chat_id": "C1", "thread_id": "T1"}
+
+    @pytest.mark.parametrize("owner", [None, "U1", {}, {"user_id": "U1", "channel_id": "C1"}])
+    def test_malformed_owner_provenance_fails_closed(self, owner):
+        with pytest.raises(RuntimeError, match="owner provenance"):
+            _employee_cron_identity({"employee_owner": owner})
 
 
 class TestPerJobToolsetMcpMerge:
