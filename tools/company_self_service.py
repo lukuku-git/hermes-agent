@@ -609,6 +609,12 @@ _SCHEMA = {
     }
 }
 
+registry.register(
+    name="company_self_service", toolset="company_self_service", schema=_SCHEMA,
+    handler=lambda args, **kw: company_self_service(args),
+    check_fn=lambda: _is_employee_turn(), emoji="🏢",
+)
+
 _ADMIN_SCHEMA = {
     "name": "company_asset_admin",
     "description": "Approve or reject a pending company asset (trusted Slack administrators only).",
@@ -622,6 +628,11 @@ _ADMIN_SCHEMA = {
         "required": ["action", "asset_id"],
     },
 }
+registry.register(
+    name="company_asset_admin", toolset="company_self_service", schema=_ADMIN_SCHEMA,
+    handler=lambda args, **kw: company_asset_admin(args),
+    check_fn=lambda: _is_admin_turn(), emoji="🛡️",
+)
 
 
 def _is_admin_turn() -> bool:
@@ -642,20 +653,3 @@ def _is_employee_turn() -> bool:
         return True
     except PermissionError:
         return False
-
-
-# Availability is authorization-context dependent and must be recomputed for
-# every turn rather than inherited from the registry's normal probe TTL cache.
-_is_admin_turn._hermes_no_cache = True
-_is_employee_turn._hermes_no_cache = True
-
-registry.register(
-    name="company_self_service", toolset="company_self_service", schema=_SCHEMA,
-    handler=lambda args, **kw: company_self_service(args),
-    check_fn=_is_employee_turn, emoji="🏢",
-)
-registry.register(
-    name="company_asset_admin", toolset="company_self_service", schema=_ADMIN_SCHEMA,
-    handler=lambda args, **kw: company_asset_admin(args),
-    check_fn=_is_admin_turn, emoji="🛡️",
-)

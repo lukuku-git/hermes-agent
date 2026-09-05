@@ -269,10 +269,7 @@ def check_fn_cache_scope() -> Optional[str]:
 
 
 def _check_fn_cached(fn: Callable) -> bool:
-    """Return bool(fn()), TTL-cached across calls unless explicitly dynamic.
-
-    Context-bound authorization checks must set ``_hermes_no_cache = True``:
-    caching those checks can leak one turn's availability into another turn.
+    """Return bool(fn()), TTL-cached across calls.
 
     Exceptions are swallowed as False. A transient False/exception within
     ``_CHECK_FN_FAILURE_GRACE_SECONDS`` of the last True is suppressed (the
@@ -280,17 +277,6 @@ def _check_fn_cached(fn: Callable) -> bool:
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
-    if getattr(fn, "_hermes_no_cache", False):
-        try:
-            return bool(fn())
-        except Exception:
-            logger.warning(
-                "dynamic check_fn %s raised; dependent tools will be unavailable this turn",
-                getattr(fn, "__qualname__", fn),
-                exc_info=True,
-            )
-            return False
-
     now = time.monotonic()
     scope = check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:
