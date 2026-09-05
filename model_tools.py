@@ -333,6 +333,21 @@ def get_tool_definitions(
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
         profile_scope = check_fn_cache_scope()
+        # Tool availability can depend on gateway-authenticated turn identity
+        # (for example, Slack-only administrator tools). Partition the schema
+        # cache by trusted context so a prior admin/non-admin turn cannot leak
+        # its tool list into another principal's turn.
+        try:
+            from gateway.session_context import trusted_session_identity, trusted_session_is_admin
+            _trusted_ident = trusted_session_identity()
+            trusted_turn_scope = (
+                (_trusted_ident or {}).get("platform", "").lower(),
+                (_trusted_ident or {}).get("user_id", ""),
+                (_trusted_ident or {}).get("chat_id", ""),
+                trusted_session_is_admin(),
+            ) if _trusted_ident else None
+        except ImportError:
+            trusted_turn_scope = None
         if profile_scope != CHECK_FN_CACHE_BYPASS:
             cache_key = (
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
@@ -343,6 +358,7 @@ def get_tool_definitions(
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
                 profile_scope,
+                trusted_turn_scope,
             )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:

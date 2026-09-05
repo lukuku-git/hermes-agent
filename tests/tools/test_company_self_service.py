@@ -108,6 +108,51 @@ def test_company_candidate_not_injected_until_trusted_admin_promotion_and_reject
     assert not css._SPOOF_FIELDS.intersection(css._ADMIN_SCHEMA["parameters"]["properties"])
 
 
+def test_admin_tool_exposure_tracks_each_trusted_slack_turn():
+    from model_tools import get_tool_definitions
+
+    def names():
+        return {
+            item["function"]["name"]
+            for item in get_tool_definitions(
+                enabled_toolsets=["company_self_service"], quiet_mode=True
+            )
+        }
+
+    bind(admin=False)
+    assert "company_self_service" in names()
+    assert "company_asset_admin" not in names()
+
+    bind(user="ADMIN", admin=True)
+    assert "company_asset_admin" in names()
+
+    # A prior admin turn must not leave the privileged schema exposed.
+    bind(user="UA", admin=False)
+    assert "company_asset_admin" not in names()
+
+    # Trusted admin state without Slack identity is insufficient.
+    set_session_vars(
+        platform="telegram", user_id="ADMIN", chat_id="CA",
+        thread_id="TA", message_id="MA", is_admin=True,
+    )
+    assert "company_asset_admin" not in names()
+
+
+def test_admin_tool_direct_dispatch_fails_closed_for_non_admin():
+    bind()
+    direct = json.loads(css.company_asset_admin({"action": "promote", "asset_id": 1}))
+    assert direct["success"] is False
+    assert "trusted Slack administrator context" in direct["error"]
+
+    from model_tools import handle_function_call
+
+    result = json.loads(handle_function_call(
+        "company_asset_admin", {"action": "promote", "asset_id": 1}
+    ))
+    assert result["success"] is False
+    assert "trusted Slack administrator context" in result["error"]
+
+
 def test_supersede_rollback_and_immutable_audit_provenance():
     bind()
     first = call(action="memory_put", name="pref", content="one")

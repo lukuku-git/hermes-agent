@@ -56,7 +56,7 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory", "company_self_service",
+    "todo", "memory", "company_self_service", "company_asset_admin",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -102,7 +102,7 @@ TOOLSETS = {
     # Basic toolsets - individual tool categories
     "company_self_service": {
         "description": "Trusted Slack employee owner-scoped memory, skills, and cron",
-        "tools": ["company_self_service"],
+        "tools": ["company_self_service", "company_asset_admin"],
         "includes": []
     },
 
