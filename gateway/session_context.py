@@ -92,6 +92,9 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+# Trusted authorization state. Unlike ordinary metadata, this value must never
+# be accepted from process environment fallback.
+_SESSION_IS_ADMIN: ContextVar = ContextVar("HERMES_SESSION_IS_ADMIN", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
@@ -220,6 +223,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    is_admin: bool = False,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -258,6 +262,7 @@ def set_session_vars(
         _SESSION_ID.set(session_id),
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
+        _SESSION_IS_ADMIN.set(bool(is_admin)),
         _SESSION_PROFILE.set(profile),
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
@@ -295,6 +300,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_ID,
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
+        _SESSION_IS_ADMIN,
         _SESSION_PROFILE,
         _CRON_SESSION,
     ):
@@ -348,6 +354,7 @@ def reset_session_vars() -> None:
     """
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _SESSION_IS_ADMIN.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
@@ -358,6 +365,32 @@ def reset_session_vars() -> None:
         clear_session_cwd()
     except Exception:
         pass
+
+
+def trusted_session_identity() -> dict[str, str] | None:
+    """Return only identity explicitly bound by ``set_session_vars``.
+
+    Unlike :func:`get_session_env`, this never falls back to process environment
+    variables. It is therefore suitable for authorization decisions: a caller
+    cannot become a Slack principal by forging ``HERMES_SESSION_*`` in its env.
+    """
+    values = {
+        "platform": _SESSION_PLATFORM.get(),
+        "source": _SESSION_SOURCE.get(),
+        "chat_id": _SESSION_CHAT_ID.get(),
+        "thread_id": _SESSION_THREAD_ID.get(),
+        "message_id": _SESSION_MESSAGE_ID.get(),
+        "user_id": _SESSION_USER_ID.get(),
+        "session_id": _SESSION_ID.get(),
+    }
+    if any(value is _UNSET for value in values.values()):
+        return None
+    return {key: str(value or "") for key, value in values.items()}
+
+
+def trusted_session_is_admin() -> bool:
+    """Return gateway-authenticated admin state without environment fallback."""
+    return _SESSION_IS_ADMIN.get() is True
 
 
 def get_session_env(name: str, default: str = "") -> str:

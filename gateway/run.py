@@ -21044,6 +21044,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+
+        # Self-service admin authority is authenticated exactly here, from the
+        # real SessionSource plus the explicit Slack policy. Do not use
+        # SlashAccessPolicy.is_admin(): its disabled-policy => True behavior is
+        # retained for slash-command compatibility but must fail closed here.
+        _trusted_admin = False
+        if isinstance(context.source, SessionSource) and context.source.platform == Platform.SLACK:
+            from gateway.slash_access import policy_for_source
+
+            _policy = policy_for_source(getattr(self, "config", None), context.source)
+            _user_id = str(context.source.user_id or "")
+            _trusted_admin = bool(
+                _policy.enabled
+                and _user_id
+                and _user_id in _policy.admin_user_ids
+            )
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -21059,6 +21075,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
+            is_admin=_trusted_admin,
         )
 
     def _clear_session_env(self, tokens: list) -> None:

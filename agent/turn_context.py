@@ -73,6 +73,16 @@ def compose_user_api_content(
     if not isinstance(content, str):
         return None
     injections = []
+    # Employee context joins other per-turn memory at this one trusted API
+    # sidecar boundary. It is recomputed from gateway-bound identity only,
+    # deterministically ordered and independently size-capped by the store.
+    try:
+        from tools.company_self_service import employee_context_for_turn
+        employee_context = employee_context_for_turn()
+    except Exception:
+        employee_context = ""
+    if employee_context:
+        injections.append(employee_context)
     if ext_prefetch_cache:
         fenced = build_memory_context_block(ext_prefetch_cache)
         if fenced:

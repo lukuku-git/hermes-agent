@@ -11,8 +11,7 @@ from gateway.session_context import (
     set_session_vars,
     clear_session_vars,
     reset_session_vars,
-    _VAR_MAP,
-    _UNSET,
+    trusted_session_is_admin,
 )
 
 
@@ -25,10 +24,9 @@ def _reset_contextvars():
     context, so a clear_session_vars() from test A (which sets vars to "")
     would leak into test B.  This fixture ensures each test starts clean.
     """
+    reset_session_vars()
     yield
-    for var in _VAR_MAP.values():
-        # Can't use var.reset() without a token; just set back to sentinel.
-        var.set(_UNSET)
+    reset_session_vars()
 
 
 def test_set_session_env_sets_contextvars(monkeypatch):
@@ -272,4 +270,57 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
 
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
+
+
+def _slack_context(user_id: str) -> SessionContext:
+    return SessionContext(
+        source=SessionSource(
+            platform=Platform.SLACK, chat_id="C1", chat_type="channel",
+            user_id=user_id, thread_id="T1", message_id="M1",
+        ),
+        connected_platforms=[], home_channels={}, session_key="slack-session",
+    )
+
+
+def test_trusted_admin_is_explicit_policy_only_and_env_cannot_forge(monkeypatch):
+    from types import SimpleNamespace
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner.config = SimpleNamespace(platforms={
+        Platform.SLACK: SimpleNamespace(extra={"group_allow_admin_from": ["ADMIN"]})
+    })
+    monkeypatch.setenv("HERMES_SESSION_IS_ADMIN", "1")
+
+    tokens = runner._set_session_env(_slack_context("EMPLOYEE"))
+    assert trusted_session_is_admin() is False
+    runner._clear_session_env(tokens)
+    assert trusted_session_is_admin() is False
+
+    tokens = runner._set_session_env(_slack_context("ADMIN"))
+    assert trusted_session_is_admin() is True
+    runner._clear_session_env(tokens)
+    assert trusted_session_is_admin() is False
+
+
+def test_trusted_admin_disabled_policy_fails_closed_and_context_is_inherited():
+    from types import SimpleNamespace
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner.config = SimpleNamespace(platforms={
+        Platform.SLACK: SimpleNamespace(extra={})
+    })
+    tokens = runner._set_session_env(_slack_context("ANYONE"))
+    assert trusted_session_is_admin() is False
+    runner._clear_session_env(tokens)
+
+    tokens = set_session_vars(platform="slack", is_admin=True)
+
+    async def child_value():
+        return trusted_session_is_admin()
+
+    assert asyncio.run(child_value()) is True
+    clear_session_vars(tokens)
+    assert trusted_session_is_admin() is False
 

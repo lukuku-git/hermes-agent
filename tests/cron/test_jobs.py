@@ -1139,3 +1139,75 @@ class TestAdvanceNextRuns:
         assert advance_next_run(rec_ids[0]) is True
         assert advance_next_run(one_ids[0]) is False
         assert advance_next_run("missing-id") is False
+
+
+class TestEmployeeAtomicMutations:
+    @staticmethod
+    def _create(owner, *, max_active=5):
+        return create_job(
+            "employee task", "every 1h",
+            employee_owner={"user_id": owner, "channel_id": "C", "thread_id": "T"},
+            employee_expected_owner=owner,
+            employee_audit_event={"event": "create", "principal": owner},
+            employee_max_active=max_active,
+        )
+
+    def test_owner_audit_are_immutable_and_remove_is_logical(self, tmp_cron_dir):
+        from cron.jobs import mutate_employee_job
+
+        job = self._create("A")
+        with pytest.raises(ValueError):
+            update_job(job["id"], {"employee_owner": {"user_id": "B"}})
+        with pytest.raises(ValueError):
+            update_job(job["id"], {"employee_audit": []})
+        with pytest.raises(PermissionError):
+            mutate_employee_job(
+                job["id"], expected_owner="B", action="pause",
+                audit_event={"event": "pause", "principal": "B"},
+            )
+        removed = mutate_employee_job(
+            job["id"], expected_owner="A", action="remove",
+            audit_event={"event": "remove", "principal": "A"},
+        )
+        assert removed["state"] == "removed" and removed["enabled"] is False
+        stored = get_job(job["id"])
+        assert stored["employee_owner"]["user_id"] == "A"
+        assert [e["event"] for e in stored["employee_audit"]] == ["create", "remove"]
+
+    def test_resume_enforces_quota_before_atomic_mutation(self, tmp_cron_dir):
+        from cron.jobs import mutate_employee_job
+
+        paused = self._create("A")
+        mutate_employee_job(
+            paused["id"], expected_owner="A", action="pause",
+            audit_event={"event": "pause", "principal": "A"},
+        )
+        for _ in range(5):
+            self._create("A")
+        with pytest.raises(ValueError, match="quota"):
+            mutate_employee_job(
+                paused["id"], expected_owner="A", action="resume",
+                audit_event={"event": "resume", "principal": "A"}, max_active=5,
+            )
+        stored = get_job(paused["id"])
+        assert stored["state"] == "paused"
+        assert [e["event"] for e in stored["employee_audit"]] == ["create", "pause"]
+
+    def test_concurrent_creates_enforce_active_quota_under_jobs_lock(self, tmp_cron_dir):
+        barrier = threading.Barrier(8)
+        results = []
+
+        def worker():
+            barrier.wait()
+            try:
+                results.append(self._create("A", max_active=5)["id"])
+            except ValueError:
+                results.append(None)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert len([result for result in results if result]) == 5
+        assert len([job for job in load_jobs() if job.get("enabled")]) == 5

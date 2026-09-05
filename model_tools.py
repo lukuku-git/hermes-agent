@@ -1239,6 +1239,18 @@ def handle_function_call(
         except Exception as _mw_err:
             logger.debug("tool_request middleware error: %s", _mw_err)
 
+    # Built-in owner boundary also lives in the common dispatcher. This covers
+    # execute_code RPC and direct/internal dispatch paths that do not traverse
+    # AIAgent's execution middleware; the agent middleware enforces the same
+    # rule before its special-case memory handling.
+    try:
+        from tools.company_self_service import generic_slack_tool_block
+        _employee_block = generic_slack_tool_block(function_name, function_args)
+    except ImportError:
+        _employee_block = None
+    if _employee_block is not None:
+        return tool_error(_employee_block)
+
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")

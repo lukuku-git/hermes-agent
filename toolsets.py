@@ -56,7 +56,7 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory",
+    "todo", "memory", "company_self_service",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -100,6 +100,12 @@ _HERMES_WEBHOOK_SAFE_TOOLS = [
 # These can include individual tools or reference other toolsets
 TOOLSETS = {
     # Basic toolsets - individual tool categories
+    "company_self_service": {
+        "description": "Trusted Slack employee owner-scoped memory, skills, and cron",
+        "tools": ["company_self_service"],
+        "includes": []
+    },
+
     "web": {
         "description": "Web research and content extraction tools",
         "tools": ["web_search", "web_extract"],
@@ -218,6 +224,12 @@ TOOLSETS = {
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
         "tools": ["read_file", "write_file", "patch", "search_files"],
+        "includes": []
+    },
+
+    "workspace": {
+        "description": "Capability-scoped file access under a trusted launcher-provided workspace root",
+        "tools": ["workspace_read", "workspace_search", "workspace_write", "workspace_patch"],
         "includes": []
     },
     
