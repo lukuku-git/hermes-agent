@@ -124,6 +124,16 @@ def test_workspace_alias_contains_only_scoped_tools():
     assert not ({"read_file", "terminal", "process", "execute_code"} & set(resolve_toolset("workspace")))
 
 
+def test_workspace_readonly_contains_only_review_tools():
+    assert resolve_toolset("workspace_readonly") == [
+        "workspace_read", "workspace_search",
+    ]
+    assert not ({
+        "workspace_write", "workspace_patch", "write_file", "patch",
+        "terminal", "process", "execute_code",
+    } & set(resolve_toolset("workspace_readonly")))
+
+
 def test_builtin_discovery_registers_and_exposes_workspace_tools(root):
     """Exercise discovery in a fresh process, not the already-imported test module."""
     expected = {"workspace_read", "workspace_search", "workspace_write", "workspace_patch"}

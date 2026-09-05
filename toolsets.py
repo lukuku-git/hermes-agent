@@ -232,6 +232,12 @@ TOOLSETS = {
         "tools": ["workspace_read", "workspace_search", "workspace_write", "workspace_patch"],
         "includes": []
     },
+
+    "workspace_readonly": {
+        "description": "Read-only review access under a trusted launcher-provided workspace root",
+        "tools": ["workspace_read", "workspace_search"],
+        "includes": []
+    },
     
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
