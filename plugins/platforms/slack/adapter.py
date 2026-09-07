@@ -9028,7 +9028,29 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
         os.environ["SLACK_IGNORED_CHANNELS"] = str(ic)
-    return None  # all settings flow through env; nothing to merge into extras
+    # Per-profile scope. The env writes above stay for anything reading them
+    # directly, but a multiplexed gateway needs each profile's own answer, and
+    # the adapter checks config.extra before env. Only keys this profile
+    # actually declared are returned, so an absent key still falls through to
+    # the shared env value rather than being pinned to a default.
+    scoped = {
+        key: slack_cfg[key]
+        for key in (
+            "require_mention",
+            "strict_mention",
+            "thread_require_mention",
+            "ignore_other_user_mentions",
+            "free_response_channels",
+            "require_mention_channels",
+            "allow_bots",
+            "allowed_channels",
+        )
+        if key in slack_cfg
+    }
+    for _list_key in ("free_response_channels", "require_mention_channels"):
+        if isinstance(scoped.get(_list_key), list):
+            scoped[_list_key] = ",".join(str(v) for v in scoped[_list_key])
+    return scoped or None
 
 
 def _is_connected(config) -> bool:
