@@ -12,12 +12,15 @@ extracted functions reach back through the ``run_agent`` module via
 
 from __future__ import annotations
 
+import ast
 import concurrent.futures
 import json
 from pathlib import Path
 import logging
 import os
 import random
+import re
+import shlex
 import threading
 import time
 from dataclasses import dataclass
@@ -300,6 +303,314 @@ class _ManagedToolResult:
     blocked: bool
 
 
+_OWNER_TELEGRAM_USER_ID = "6834626936"
+_OWNER_SLACK_USER_ID = "U0AQ874R6SG"
+_PROTECTED_ROOT_FILES = frozenset(
+    {"SOUL.md", "config.yaml", ".env", "auth.json", "admins.yaml"}
+)
+_MUTATING_SHELL_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:sed\b[^\n;&|]*-i(?:\s|$)|rm(?:\s|$)|mv(?:\s|$)|"
+    r"cp(?:\s|$)|install(?:\s|$)|tee(?:\s|$)|truncate(?:\s|$)|chmod(?:\s|$)|"
+    r"chown(?:\s|$)|ln(?:\s|$)|touch(?:\s|$))|(?:^|[^<])>{1,2}",
+    re.IGNORECASE,
+)
+_CODE_MUTATION_RE = re.compile(
+    r"write_text|write_bytes|open\s*\([^\n]*['\"](?:w|a|x)|unlink\s*\(|"
+    r"remove\s*\(|rename\s*\(|replace\s*\(|rmtree\s*\(|os\.system\s*\(|"
+    r"subprocess\.(?:run|call|Popen)",
+    re.IGNORECASE,
+)
+_GATEWAY_CONTROL_RE = re.compile(
+    r"\bhermes\s+gateway\s+(?:restart|stop|start)\b|"
+    r"\b(?:kill|pkill)\b[^\n;&|]*(?:gateway|gateway\.pid)|"
+    r"(?:gateway\.(?:pid|lock))[^\n;&|]*(?:rm|unlink|truncate|>|write)|"
+    r"\b(?:launchctl|systemctl|service)\b[^\n;&|]*(?:load|unload|enable|disable|"
+    r"start|stop|restart|bootstrap|bootout)",
+    re.IGNORECASE,
+)
+
+
+def _read_admin_registry(home: Path) -> str:
+    """Read the future admin roster on every decision; admins grant no rights yet."""
+    try:
+        return (home / "admins.yaml").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ""
+
+
+def _resolved_candidate(raw: str, *, cwd: str | None = None) -> Path:
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path(cwd or os.getcwd()) / path
+    return path.resolve(strict=False)
+
+
+def _is_protected_path(raw: str, home: Path, *, cwd: str | None = None) -> bool:
+    if not raw or raw.startswith("-"):
+        return False
+    candidate = _resolved_candidate(raw, cwd=cwd)
+    if candidate.parent == home and candidate.name in _PROTECTED_ROOT_FILES:
+        return True
+    try:
+        relative = candidate.relative_to(home)
+    except ValueError:
+        return False
+    return bool(relative.parts) and relative.parts[0] in {
+        "hermes-agent",
+        "cron",
+        "memories",
+    }
+
+
+def _shell_mentions_protected_path(command: str, home: Path, *, cwd: str | None) -> bool:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        tokens = command.split()
+    for token in tokens:
+        token = token.strip(";|&(){}[],:\"'")
+        if _is_protected_path(token, home, cwd=cwd):
+            return True
+    return False
+
+
+def _code_mentions_protected_path(code: str, home: Path) -> bool:
+    """Inspect Python string literals used by common execute_code mutations."""
+    for match in re.finditer(r"['\"]([^'\"\n]+)['\"]", code):
+        if _is_protected_path(match.group(1), home):
+            return True
+    return False
+
+
+def _patch_body_paths(patch_body: str) -> list[str]:
+    """Extract file operands from the V4A multi-file patch envelope."""
+    return re.findall(
+        r"(?m)^\*\*\* (?:Update|Add|Delete|Move to) File:\s*(.+?)\s*$",
+        patch_body,
+    )
+
+
+def _patch_touches_protected_path(function_args: dict[str, Any], home: Path) -> bool:
+    path = str(function_args.get("path", ""))
+    if path and _is_protected_path(path, home):
+        return True
+    if str(function_args.get("mode", "replace")).lower() != "patch":
+        return False
+    return any(
+        _is_protected_path(path, home)
+        for path in _patch_body_paths(str(function_args.get("patch", "")))
+    )
+
+
+def _call_name(node: ast.Call) -> str:
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return ""
+
+
+def _constant_strings(node: ast.AST) -> list[str]:
+    return [
+        child.value
+        for child in ast.walk(node)
+        if isinstance(child, ast.Constant) and isinstance(child.value, str)
+    ]
+
+
+def _code_calls_sensitive_tool(code: str, home: Path) -> bool:
+    """Detect direct execute_code calls into mutating hermes_tools surfaces."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node)
+        strings = _constant_strings(node)
+        if name in {"write_file", "patch"}:
+            if any(_is_protected_path(value, home) for value in strings):
+                return True
+            if name == "patch" and any(
+                _patch_touches_protected_path({"mode": "patch", "patch": value}, home)
+                for value in strings
+            ):
+                return True
+        if name == "terminal":
+            for command in strings:
+                if _GATEWAY_CONTROL_RE.search(command) or (
+                    _MUTATING_SHELL_RE.search(command)
+                    and _shell_mentions_protected_path(command, home, cwd=None)
+                ):
+                    return True
+    return False
+
+
+def _admins_owner_preserved(content: str) -> bool:
+    try:
+        import yaml
+
+        document = yaml.safe_load(content)
+    except Exception:
+        return False
+    if not isinstance(document, dict):
+        return False
+    return document.get("owner") == [
+        {"platform": "telegram", "user_id": _OWNER_TELEGRAM_USER_ID},
+        {"platform": "slack", "user_id": _OWNER_SLACK_USER_ID},
+    ]
+
+
+def _is_admins_path(raw: str, home: Path, *, cwd: str | None = None) -> bool:
+    return bool(raw) and _resolved_candidate(raw, cwd=cwd) == home / "admins.yaml"
+
+
+def _shell_mentions_admins_path(command: str, home: Path, *, cwd: str | None) -> bool:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        tokens = command.split()
+    return any(
+        _is_admins_path(token.strip(";|&(){}[],:\"'"), home, cwd=cwd)
+        for token in tokens
+    )
+
+
+def _code_mentions_admins_path(code: str, home: Path) -> bool:
+    try:
+        strings = _constant_strings(ast.parse(code))
+    except SyntaxError:
+        strings = [match.group(1) for match in re.finditer(r"['\"]([^'\"\n]+)['\"]", code)]
+    return any(
+        _is_admins_path(value, home)
+        or _shell_mentions_admins_path(value, home, cwd=None)
+        for value in strings
+    )
+
+
+def _attempts_owner_root_removal(
+    function_name: str, function_args: dict[str, Any], home: Path
+) -> bool:
+    path = str(function_args.get("path", ""))
+    if not path or _resolved_candidate(path) != home / "admins.yaml":
+        return False
+    if function_name == "write_file":
+        return not _admins_owner_preserved(str(function_args.get("content", "")))
+    if function_name == "patch":
+        try:
+            current = (home / "admins.yaml").read_text(encoding="utf-8")
+            old = str(function_args.get("old_string", ""))
+            new = str(function_args.get("new_string", ""))
+            if not old or old not in current:
+                return True
+            proposed = current.replace(old, new) if function_args.get("replace_all") else current.replace(old, new, 1)
+            return not _admins_owner_preserved(proposed)
+        except (OSError, UnicodeError):
+            return True
+    return False
+
+
+def _is_authorized_sensitive_owner() -> bool:
+    from gateway.config import Platform
+    from gateway.session_context import get_session_env
+
+    source = get_session_env("HERMES_SESSION_SOURCE", "").strip().lower()
+    platform_raw = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    user_id = get_session_env("HERMES_SESSION_USER_ID", "").strip()
+    cron = get_session_env("HERMES_CRON_SESSION", "").strip()
+    if cron == "1":
+        return False
+    if source in {"cli", "ssh"}:
+        return platform_raw in {"", Platform.LOCAL.value}
+    try:
+        platform = Platform(platform_raw)
+    except ValueError:
+        return False
+    if platform == Platform.SLACK:
+        return False
+    return platform == Platform.TELEGRAM and user_id == _OWNER_TELEGRAM_USER_ID
+
+
+def _sensitive_tool_block_reason(
+    function_name: str, function_args: dict[str, Any]
+) -> str | None:
+    """Return a deterministic Korean denial for sensitive mutations, if any."""
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home().expanduser().resolve(strict=False)
+    _read_admin_registry(home)  # Required fresh read; roster authority is future work.
+    sensitive = False
+    unprovable_admins_mutation = False
+
+    if function_name == "memory":
+        target_is_shared = str(function_args.get("target", "memory")).lower() == "memory"
+        actions = [str(function_args.get("action", "")).lower()]
+        operations = function_args.get("operations", [])
+        if isinstance(operations, list):
+            actions.extend(
+                str(operation.get("action", "")).lower()
+                for operation in operations
+                if isinstance(operation, dict)
+            )
+        sensitive = target_is_shared and any(
+            action in {"add", "replace", "remove"} for action in actions
+        )
+    elif function_name == "write_file":
+        sensitive = _is_protected_path(str(function_args.get("path", "")), home)
+    elif function_name == "patch":
+        sensitive = _patch_touches_protected_path(function_args, home)
+        if str(function_args.get("mode", "replace")).lower() == "patch":
+            unprovable_admins_mutation = any(
+                _is_admins_path(path, home)
+                for path in _patch_body_paths(str(function_args.get("patch", "")))
+            )
+    elif function_name == "cronjob":
+        sensitive = str(function_args.get("action", "")).lower() in {
+            "create", "update", "pause", "resume", "remove"
+        }
+    elif function_name == "terminal":
+        command = str(function_args.get("command", ""))
+        cwd = function_args.get("workdir")
+        cwd_text = str(cwd) if cwd else None
+        mutates_protected = bool(
+            _MUTATING_SHELL_RE.search(command)
+            and _shell_mentions_protected_path(command, home, cwd=cwd_text)
+        )
+        sensitive = bool(_GATEWAY_CONTROL_RE.search(command)) or mutates_protected
+        unprovable_admins_mutation = mutates_protected and _shell_mentions_admins_path(
+            command, home, cwd=cwd_text
+        )
+    elif function_name == "execute_code":
+        code = str(function_args.get("code", ""))
+        mutates_protected = bool(
+            (_CODE_MUTATION_RE.search(code) or _MUTATING_SHELL_RE.search(code))
+            and _code_mentions_protected_path(code, home)
+        )
+        sensitive = (
+            bool(_GATEWAY_CONTROL_RE.search(code))
+            or mutates_protected
+            or _code_calls_sensitive_tool(code, home)
+        )
+        unprovable_admins_mutation = sensitive and _code_mentions_admins_path(code, home)
+
+    if not sensitive:
+        return None
+    if unprovable_admins_mutation:
+        return (
+            "admins.yaml 소유자 항목은 terminal/execute_code에서 안전하게 검증할 수 없어 변경할 수 없습니다. "
+            "직접 파일 도구(write_file 또는 patch)를 사용해 두 소유자 항목을 모두 유지해 주세요."
+        )
+    if _attempts_owner_root_removal(function_name, function_args, home):
+        return "보안 정책상 루트 소유자 항목은 제거할 수 없습니다. 기존 소유자 정보를 유지해 다시 요청해 주세요."
+    if _is_authorized_sensitive_owner():
+        return None
+    return (
+        "보호된 Hermes 설정 또는 공유 저장소 변경은 소유자 권한이 필요합니다. "
+        "Telegram 소유자 계정 또는 로컬 CLI/SSH에서 다시 요청해 주세요."
+    )
+
+
 class _ConcurrentToolAuthorizationGate:
     """Serialize policy prompts and exclude their queue from batch deadlines."""
 
@@ -365,7 +676,29 @@ def _run_agent_tool_execution_middleware(
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
-    """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    """Apply the sensitive guard, then Relay/Hermes policy, and dispatch once."""
+    sensitive_block = _sensitive_tool_block_reason(function_name, function_args)
+    if sensitive_block is not None:
+        result = json.dumps({"error": sensitive_block}, ensure_ascii=False)
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=function_name,
+            function_args=function_args,
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+            status="blocked",
+            error_type="sensitive_value_guard_block",
+            error_message=sensitive_block,
+            middleware_trace=[],
+        )
+        return _ManagedToolResult(
+            result=result,
+            args=function_args,
+            middleware_trace=[],
+            blocked=True,
+        )
+
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
