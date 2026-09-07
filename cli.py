@@ -3172,6 +3172,20 @@ def _cprint(text: str):
             pass
 
 
+def _rprint(text: str):
+    """Reasoning-only sink.
+
+    Reasoning is diagnostic narration, not the answer. When stdout is not a
+    TTY it is being consumed programmatically (strict worker launcher, pipes),
+    so the panel must not contaminate the data channel — send it to stderr.
+    Interactive rendering is unchanged.
+    """
+    if not sys.stdout.isatty():
+        print(text, file=sys.stderr)
+        return
+    _cprint(text)
+
+
 def _prepend_note_to_message(message, note: str):
     """Prepend a one-shot system-style note to a user message.
 
@@ -6578,7 +6592,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             w = self._scrollback_box_width()
             r_label = " Reasoning "
             r_fill = w - 2 - len(r_label)
-            _cprint(f"\n{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
+            _rprint(f"\n{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
 
         self._reasoning_buf = getattr(self, "_reasoning_buf", "") + text
 
@@ -6586,9 +6600,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # reasoning is visible in real-time even without newlines.
         while "\n" in self._reasoning_buf:
             line, self._reasoning_buf = self._reasoning_buf.split("\n", 1)
-            _cprint(f"{_DIM}{line}{_RST}")
+            _rprint(f"{_DIM}{line}{_RST}")
         if len(self._reasoning_buf) > 80:
-            _cprint(f"{_DIM}{self._reasoning_buf}{_RST}")
+            _rprint(f"{_DIM}{self._reasoning_buf}{_RST}")
             self._reasoning_buf = ""
 
     def _close_reasoning_box(self) -> None:
@@ -6597,10 +6611,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Flush remaining reasoning buffer
             buf = getattr(self, "_reasoning_buf", "")
             if buf:
-                _cprint(f"{_DIM}{buf}{_RST}")
+                _rprint(f"{_DIM}{buf}{_RST}")
                 self._reasoning_buf = ""
             w = self._scrollback_box_width()
-            _cprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
+            _rprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
             self._reasoning_box_opened = False
 
             # Flush any content that was deferred while reasoning was rendering.
