@@ -4901,7 +4901,24 @@ def set_config_value(key: str, value: str, force: bool = False):
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
+    default_value = _default_value_for_key(key)
+    if isinstance(default_value, (list, dict)):
+        try:
+            structured_value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            print(
+                f"✗ Cannot set '{key}': expected JSON {type(default_value).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not isinstance(structured_value, type(default_value)):
+            print(
+                f"✗ Cannot set '{key}': expected JSON {type(default_value).__name__}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        coerced_value = structured_value
+    elif not isinstance(default_value, str):
         if value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
         elif value.lower() in {'false', 'no', 'off'}:

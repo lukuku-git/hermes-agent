@@ -98,6 +98,14 @@ class TestConfigYamlRouting:
         assert "model" not in _read_env(_isolated_hermes_home)
 
 
+    def test_known_list_key_accepts_json_array(self, _isolated_hermes_home):
+        deny = ["*git*push*--force*", "*gh*pr*merge*"]
+        set_config_value("approvals.deny", json.dumps(deny))
+        import yaml
+
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert config["approvals"]["deny"] == deny
+
     def test_terminal_image_goes_to_config(self, _isolated_hermes_home):
         """TERMINAL_DOCKER_IMAGE doesn't match _API_KEY or _TOKEN, so config.yaml."""
         set_config_value("terminal.docker_image", "python:3.12")
