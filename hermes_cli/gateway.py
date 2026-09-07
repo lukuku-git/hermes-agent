@@ -171,6 +171,12 @@ def _get_service_pids() -> set:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
+    # --- launchd system domain (macOS LaunchDaemon) ---
+    if is_macos():
+        system_pid = _launchd_system_service_pid()
+        if system_pid is not None:
+            pids.add(system_pid)
+
     return pids
 
 
@@ -1358,12 +1364,18 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
         )
 
     if is_macos():
+        system_installed = get_launchd_system_plist_path().exists()
+        user_installed = get_launchd_plist_path().exists()
+        scope_label = "launchd (system)" if system_installed and not user_installed else "launchd"
         return GatewayRuntimeSnapshot(
-            manager="launchd",
-            service_installed=get_launchd_plist_path().exists(),
-            service_running=_probe_launchd_service_running(),
+            manager=scope_label,
+            service_installed=user_installed or system_installed,
+            service_running=(
+                _probe_launchd_service_running()
+                or _launchd_system_service_pid() is not None
+            ),
             gateway_pids=gateway_pids,
-            service_scope="launchd",
+            service_scope=scope_label,
         )
 
     return GatewayRuntimeSnapshot(
@@ -2509,6 +2521,48 @@ def get_launchd_plist_path() -> Path:
     suffix = _profile_suffix()
     name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
     return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
+
+
+def get_launchd_system_plist_path() -> Path:
+    """Return the system-scope LaunchDaemon path for this profile's label.
+
+    A system install puts the SAME label under ``/Library/LaunchDaemons``.
+    launchd keeps the user and system domains apart, so a user LaunchAgent
+    installed beside it becomes a second ``KeepAlive`` supervisor of the same
+    ``gateway run --replace`` command: each start replaces the other's process,
+    the PID churns, and every platform socket reconnects in a loop.
+    """
+    suffix = _profile_suffix()
+    name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+    return Path("/Library/LaunchDaemons") / f"{name}.plist"
+
+
+def _launchd_system_service_pid() -> int | None:
+    """Return the PID launchd supervises in the system domain, if any.
+
+    A LaunchDaemon never shows up in a user ``launchctl list``, so the system
+    domain has to be printed explicitly.  Reading it does not require root.
+    """
+    import re
+
+    if not get_launchd_system_plist_path().exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"system/{get_launchd_label()}"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.search(r"^\s*pid = (\d+)$", result.stdout, re.MULTILINE)
+    if not match:
+        return None
+    pid = int(match.group(1))
+    return pid if pid > 0 else None
 
 
 def _detect_venv_dir() -> Path | None:
@@ -4305,8 +4359,32 @@ def refresh_launchd_plist_if_needed() -> bool:
     return True
 
 
+def _refuse_user_agent_over_system_daemon(action: str) -> bool:
+    """True when a system LaunchDaemon already owns this label.
+
+    Installing a user LaunchAgent beside it is the duplicate-registration bug:
+    two KeepAlive supervisors for one gateway, each replacing the other.
+    """
+    system_plist = get_launchd_system_plist_path()
+    if not system_plist.exists():
+        return False
+    label = get_launchd_label()
+    print(f"✗ Refusing to {action}: a system LaunchDaemon already owns this label")
+    print(f"  {system_plist}")
+    print("  A user LaunchAgent with the same label makes launchd supervise the")
+    print("  gateway twice; `gateway run --replace` then has them kill each other.")
+    print(f"  Status:  launchctl print system/{label}")
+    print(f"  Restart: sudo launchctl kickstart -k system/{label}")
+    print(f"  Remove the daemon first if you want a user agent instead:")
+    print(f"           sudo launchctl bootout system/{label} && sudo rm {system_plist}")
+    return True
+
+
 def launchd_install(force: bool = False):
     plist_path = get_launchd_plist_path()
+
+    if not force and _refuse_user_agent_over_system_daemon("install the user agent"):
+        return
 
     if plist_path.exists() and not force:
         if not launchd_plist_is_current():
@@ -4368,6 +4446,8 @@ def launchd_start():
 
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
+        if _refuse_user_agent_over_system_daemon("regenerate the user agent"):
+            return
         new_plist = generate_launchd_plist()
         if _refuse_temp_home_service_write(new_plist, "launchd plist"):
             sys.exit(1)
@@ -4577,9 +4657,48 @@ def launchd_restart():
         _clear_launchd_unsupported_marker()
 
 
+def _print_recent_gateway_log_tail() -> None:
+    log_file = get_hermes_home() / "logs" / "gateway.log"
+    if not log_file.exists():
+        return
+    print()
+    print("Recent logs:")
+    subprocess.run(["tail", "-20", str(log_file)], timeout=10)
+
+
+def _print_launchd_duplicate_registration_warning(
+    user_plist: Path, system_plist: Path
+) -> None:
+    print()
+    print("⚠ DUPLICATE REGISTRATION: user and system launchd jobs share one label")
+    print(f"  user agent:  {user_plist}")
+    print(f"  system daemon: {system_plist}")
+    print("  Both carry KeepAlive and run `gateway run --replace`, so each start")
+    print("  kills the other's process: the PID churns and platform sockets flap.")
+    print("  Keep exactly one — remove the user agent with: hermes gateway uninstall")
+
+
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
+
+    system_plist = get_launchd_system_plist_path()
+    if system_plist.exists():
+        system_pid = _launchd_system_service_pid()
+        print(f"Launchd daemon: {system_plist} (system scope)")
+        if system_pid is not None:
+            print(f"✓ Gateway is supervised by launchd in the system domain (PID {system_pid})")
+            print("  Auto-start at boot and auto-restart on crash are available.")
+        else:
+            print("✗ System LaunchDaemon is registered but launchd is not supervising it")
+            print(f"  Inspect: launchctl print system/{label}")
+            print(f"  Start:   sudo launchctl kickstart -k system/{label}")
+        if not plist_path.exists():
+            if deep:
+                _print_recent_gateway_log_tail()
+            return
+        _print_launchd_duplicate_registration_warning(plist_path, system_plist)
+        print()
     try:
         result = subprocess.run(
             ["launchctl", "list", label],
@@ -4652,11 +4771,7 @@ def launchd_status(deep: bool = False):
             print(f"  Note: a detached gateway process is running (PID {fallback_pid})")
 
     if deep:
-        log_file = get_hermes_home() / "logs" / "gateway.log"
-        if log_file.exists():
-            print()
-            print("Recent logs:")
-            subprocess.run(["tail", "-20", str(log_file)], timeout=10)
+        _print_recent_gateway_log_tail()
 
 
 # =============================================================================
@@ -5756,7 +5871,10 @@ def _is_service_installed() -> bool:
             or get_systemd_unit_path(system=True).exists()
         )
     elif is_macos():
-        return get_launchd_plist_path().exists()
+        return (
+            get_launchd_plist_path().exists()
+            or get_launchd_system_plist_path().exists()
+        )
     elif is_windows():
         from hermes_cli import gateway_windows
 
@@ -7343,7 +7461,10 @@ def _gateway_command_inner(args):
         ):
             systemd_status(deep, system=system, full=full)
             _print_gateway_process_mismatch(snapshot)
-        elif is_macos() and get_launchd_plist_path().exists():
+        elif is_macos() and (
+            get_launchd_plist_path().exists()
+            or get_launchd_system_plist_path().exists()
+        ):
             launchd_status(deep)
             _print_gateway_process_mismatch(snapshot)
         elif _windows_service_installed:
