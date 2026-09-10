@@ -67,6 +67,10 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 logger = logging.getLogger(__name__)
 
+# #error-alert 는 헤임달 카드만 받는다 — 사람이 정한 것이지 추론이 아니다.
+_ERROR_ALERT_CHANNEL_ID = "C0C0PT7Q6RJ"
+_ERROR_ALERT_HEIMDALL_APP_ID = "A0C0PS76UGL"
+
 # User-Agent prefix for outbound Slack API calls so platform partners can
 # identify HermesAgent traffic — matching other Hermes outbound surfaces
 # that already set ``HermesAgent/<version>`` for platform-partner attribution.
@@ -5229,6 +5233,32 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: dict, payload: Optional[dict] = None
     ) -> None:
         """Handle an incoming Slack message event."""
+        # #error-alert 는 헤임달이 올린 카드에만 반응한다. 그 방은 free_response 라
+        # 멘션 없이도 답하는데, 그 탓에 캔버스 갱신·연동 제거 같은 슬랙 시스템
+        # 메시지와 다른 봇에도 답이 나갔다. 사람은 기존 mention gate 를 그대로 지나고,
+        # 편집(message_changed)은 아래에서 정규화되므로 여기서 버리지 않는다.
+        if str(event.get("channel") or "") == _ERROR_ALERT_CHANNEL_ID:
+            _sub = str(event.get("subtype") or "")
+            _profile = event.get("bot_profile") or {}
+            _app = str(
+                event.get("app_id")
+                or (_profile.get("app_id") if isinstance(_profile, dict) else "")
+                or ""
+            )
+            _bot = str(event.get("bot_id") or "")
+            if _bot or _app or _sub == "bot_message":
+                if _app != _ERROR_ALERT_HEIMDALL_APP_ID:
+                    logger.info(
+                        "[Slack] Dropping message channel=%s reason=non_heimdall_bot app_id=%s",
+                        event.get("channel"), _app or "-",
+                    )
+                    return
+            elif _sub and _sub != "message_changed":
+                logger.info(
+                    "[Slack] Dropping message channel=%s reason=slack_system_subtype:%s",
+                    event.get("channel"), _sub,
+                )
+                return
         # DEBUG entry log — fires BEFORE any filtering so users debugging
         # bot-to-bot interop, allow_bots config, or SLACK_ALLOWED_USERS
         # drops can confirm whether the event actually arrived from Slack
