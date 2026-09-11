@@ -261,6 +261,9 @@ def _wrap_markdown_tables(text: str) -> str:
 # channel concurrently.  ContextVars propagate to child asyncio.Tasks
 # (Python 3.7+), so the value set in _handle_slash_command's task is
 # visible in _process_message_background's child task.
+#: 모델을 거치지 않고 그 자리에서 답하는 커맨드. "Running …" 자리표시를 두지 않는다.
+_SLASH_SILENT_ACK = frozenset({"todo", "task"})
+
 _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "_slash_user_id",
     default=None,
@@ -2069,10 +2072,17 @@ class SlackAdapter(BasePlatformAdapter):
             @self._app.command(_slash_pattern)
             async def handle_hermes_command(ack, command):
                 slash = (command.get("command") or "").lstrip("/")
-                await ack(
-                    response_type="ephemeral",
-                    text=f"Running `/{slash}`…",
-                )
+                if slash in _SLASH_SILENT_ACK:
+                    # 자리표시를 두지 않는다. `replace_original` 은 response_url 로
+                    # 올린 메시지에만 먹히고 ack 가 만든 메시지는 지우지 못해서
+                    # "Running …" 이 답 위에 그대로 남는다. 1초 안에 답하는
+                    # 커맨드에는 그 줄이 설명이 아니라 찌꺼기다.
+                    await ack()
+                else:
+                    await ack(
+                        response_type="ephemeral",
+                        text=f"Running `/{slash}`…",
+                    )
                 await self._handle_slash_command(command)
 
             # Register Block Kit action handlers for approval buttons
