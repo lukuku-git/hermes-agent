@@ -450,7 +450,9 @@ class GatewaySlashCommandsMixin:
         args = event.get_command_args().strip()
         if command == "todo":
             return f"내 Offon 업무를 알려줘. {args}".strip()
-        return f"Offon 업무를 등록해줘: {args}".strip()
+        if command == "send":
+            return f"Offon 업무를 다른 사람에게 등록해줘: {args}".strip()
+        return f"내 Offon 업무를 등록해줘: {args}".strip()
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
