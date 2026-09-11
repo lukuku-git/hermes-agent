@@ -1571,7 +1571,9 @@ class SlackAdapter(BasePlatformAdapter):
                         "response_type": "ephemeral",
                         # Only the first chunk replaces the "Running /cmd…"
                         # ack; the rest append as new ephemeral messages.
-                        "replace_original": idx == 0,
+                        # 자리표시를 두지 않은 커맨드에는 바꿔 칠 원본이 없으므로
+                        # 그냥 새로 올린다.
+                        "replace_original": idx == 0 and not ctx.get("silent_ack"),
                         "text": chunk,
                     }
                     async with session.post(
@@ -7797,6 +7799,10 @@ class SlackAdapter(BasePlatformAdapter):
                 # delivery fails — postEphemeral needs an explicit user.
                 "user_id": user_id,
                 "ts": time.monotonic(),
+                # 자리표시 없이 ack 한 커맨드에는 바꿔 칠 원본이 없다. 그런데도
+                # ``replace_original`` 을 보내면 Slack 이 그 게시를 버려서 답이
+                # 아예 나타나지 않는다.
+                "silent_ack": slash_name in _SLASH_SILENT_ACK,
             }
             if len(self._slash_command_contexts) > self._SLASH_CTX_MAX:
                 # TTL cleanup normally runs on lookup, but contexts stashed
