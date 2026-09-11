@@ -378,6 +378,80 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    # ── Offon ────────────────────────────────────────────────────────
+    # `/todo`·`/task` 의 절차는 이 포크가 아니라 petasos 의 `plugins/offon/slash.py`
+    # 가 갖는다. 여기 있는 것은 입구와 게이트뿐이다 — 업무 규칙을 포크에 적으면
+    # 저장소가 소유한 판정이 상류 코드 안으로 흩어진다.
+
+    def _offon_slash_module(self):
+        """설치된 Offon 플러그인의 slash 모듈. 없으면 None."""
+        home = os.environ.get("HERMES_HOME")
+        root = Path(home).expanduser().resolve() if home else Path.home() / ".hermes"
+        if root.parent.name == "profiles":
+            root = root.parent.parent
+        plugins = str(root / "plugins")
+        if plugins not in sys.path:
+            sys.path.insert(0, plugins)
+        try:
+            from offon import slash  # type: ignore
+
+            return slash
+        except Exception as exc:  # 플러그인이 없으면 커맨드도 없는 것처럼 군다
+            logger.warning("Offon slash module unavailable: %s", exc)
+            return None
+
+    def _offon_channel_allowed(self, adapter, source) -> bool:
+        """슬래시에도 채널 허용 목록을 건다.
+
+        어댑터의 ``allowed_channels`` 검사는 메시지 이벤트 경로에만 있다
+        (``plugins/platforms/slack/adapter.py``). 슬래시는 그 검사를 지나지
+        않으므로, 여기서 걸지 않으면 심사되지 않은 방에서 업무가 서고 자연어
+        fallback 이 에이전트를 그 방으로 끌어들인다.
+
+        DM 은 방이 아니라 사람이라 그대로 통과시킨다 — 목록은 방의 목록이다.
+        """
+        if "dm" in str(getattr(source, "chat_type", "")).lower():
+            return True
+        getter = getattr(adapter, "_slack_allowed_channels", None)
+        if getter is None:
+            return False
+        try:
+            allowed = getter()
+        except Exception:
+            return False
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        return (not allowed) or (chat_id in allowed)
+
+    async def _handle_offon_slash_command(self, event, command: str):
+        """답할 수 있으면 문장, 문법 밖이면 ``None`` (자연어 경로로 넘긴다)."""
+        source = event.source
+        if not source or str(getattr(source.platform, "value", source.platform)) != "slack":
+            return None
+        slash = self._offon_slash_module()
+        if slash is None:
+            return None
+        adapter = self._adapter_for_source(source)
+        try:
+            return await asyncio.to_thread(
+                slash.handle,
+                command,
+                event.get_command_args().strip(),
+                requester_slack_id=str(getattr(source, "user_id", "") or ""),
+                channel_id=str(getattr(source, "chat_id", "") or ""),
+                channel_allowed=self._offon_channel_allowed(adapter, source),
+            )
+        except Exception as exc:
+            logger.warning("Offon slash command failed: %s", exc)
+            return "Offon 요청을 처리하지 못했습니다. 잠시 후 다시 시도해주세요."
+
+    @staticmethod
+    def _offon_natural_language(command: str, event) -> str:
+        """문법 밖의 인자를 모델이 읽을 문장으로 바꾼다."""
+        args = event.get_command_args().strip()
+        if command == "todo":
+            return f"내 Offon 업무를 알려줘. {args}".strip()
+        return f"Offon 업무를 등록해줘: {args}".strip()
+
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
 

@@ -168,6 +168,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("context", "Show detailed context window view with usage gauge, category breakdown, compression stats, and throughput", "Session",
                aliases=("ctx",), args_hint="[all]", subcommands=("all",),
                busy_policy="dispatch"),
+    # Offon — 직원 업무의 빠른 입구. 문법 밖은 자연어로 떨어진다(D-0051).
+    CommandDef("todo", "내 Offon 업무 목록", "Info", gateway_only=True),
+    CommandDef("task", "Offon 업무 등록. 남에게 주려면 @사람 과 칸을 함께 적는다", "Info",
+               gateway_only=True,
+               args_hint="[@사람 ...] [!긴급|!중요|!보통|!낮음] <제목>"),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info",
                busy_policy="dispatch", execute="profile"),
@@ -1257,7 +1262,8 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update",
+                                    "codex-runtime", "sethome"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
