@@ -262,7 +262,7 @@ def _wrap_markdown_tables(text: str) -> str:
 # (Python 3.7+), so the value set in _handle_slash_command's task is
 # visible in _process_message_background's child task.
 #: 모델을 거치지 않고 그 자리에서 답하는 커맨드. "Running …" 자리표시를 두지 않는다.
-_SLASH_SILENT_ACK = frozenset({"todo", "task", "send"})
+_SLASH_SILENT_ACK = frozenset({"todo", "add", "send"})
 
 _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "_slash_user_id",

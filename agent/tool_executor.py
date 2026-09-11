@@ -330,12 +330,27 @@ _GATEWAY_CONTROL_RE = re.compile(
 )
 
 
-def _read_admin_registry(home: Path) -> str:
-    """Read the future admin roster on every decision; admins grant no rights yet."""
+def _read_admin_registry(home: Path) -> frozenset[tuple[str, str]]:
+    """Read valid admin identities fresh for each sensitive decision."""
     try:
-        return (home / "admins.yaml").read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return ""
+        import yaml
+
+        document = yaml.safe_load((home / "admins.yaml").read_text(encoding="utf-8"))
+    except Exception:
+        return frozenset()
+    if not isinstance(document, dict) or not isinstance(document.get("admins"), list):
+        return frozenset()
+
+    admins: set[tuple[str, str]] = set()
+    for entry in document["admins"]:
+        if not isinstance(entry, dict):
+            return frozenset()
+        platform = entry.get("platform")
+        user_id = entry.get("user_id")
+        if platform not in {"telegram", "slack"} or not isinstance(user_id, str) or not user_id.strip():
+            return frozenset()
+        admins.add((platform, user_id.strip()))
+    return frozenset(admins)
 
 
 def _resolved_candidate(raw: str, *, cwd: str | None = None) -> Path:
@@ -511,7 +526,7 @@ def _attempts_owner_root_removal(
     return False
 
 
-def _is_authorized_sensitive_owner() -> bool:
+def _is_authorized_sensitive_owner(home: Path) -> bool:
     from gateway.config import Platform
     from gateway.session_context import get_session_env
 
@@ -527,9 +542,9 @@ def _is_authorized_sensitive_owner() -> bool:
         platform = Platform(platform_raw)
     except ValueError:
         return False
-    if platform == Platform.SLACK:
-        return False
-    return platform == Platform.TELEGRAM and user_id == _OWNER_TELEGRAM_USER_ID
+    if platform == Platform.TELEGRAM and user_id == _OWNER_TELEGRAM_USER_ID:
+        return True
+    return (platform.value, user_id) in _read_admin_registry(home)
 
 
 def _sensitive_tool_block_reason(
@@ -539,7 +554,6 @@ def _sensitive_tool_block_reason(
     from hermes_constants import get_hermes_home
 
     home = get_hermes_home().expanduser().resolve(strict=False)
-    _read_admin_registry(home)  # Required fresh read; roster authority is future work.
     sensitive = False
     unprovable_admins_mutation = False
 
@@ -603,11 +617,11 @@ def _sensitive_tool_block_reason(
         )
     if _attempts_owner_root_removal(function_name, function_args, home):
         return "보안 정책상 루트 소유자 항목은 제거할 수 없습니다. 기존 소유자 정보를 유지해 다시 요청해 주세요."
-    if _is_authorized_sensitive_owner():
+    if _is_authorized_sensitive_owner(home):
         return None
     return (
-        "보호된 Hermes 설정 또는 공유 저장소 변경은 소유자 권한이 필요합니다. "
-        "Telegram 소유자 계정 또는 로컬 CLI/SSH에서 다시 요청해 주세요."
+        "보호된 Hermes 설정 또는 공유 저장소 변경은 관리자 권한이 필요합니다. "
+        "등록된 관리자 계정 또는 로컬 CLI/SSH에서 다시 요청해 주세요."
     )
 
 

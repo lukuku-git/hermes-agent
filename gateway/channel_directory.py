@@ -309,6 +309,23 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
     channels: List[Dict[str, Any]] = []
     seen_ids: set = set()
 
+    # The periodic directory refresh used to discover only joined channels and
+    # session history. An explicitly allowlisted channel with no prior session
+    # therefore stayed as a raw ID forever. Seed those IDs into the live Slack
+    # lookup path so conversations.info can resolve their canonical names.
+    extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+    raw_allowed = extra.get("allowed_channels", "")
+    if isinstance(raw_allowed, str):
+        configured_channel_ids = [
+            value.strip() for value in raw_allowed.split(",") if value.strip()
+        ]
+    elif isinstance(raw_allowed, (list, tuple, set)):
+        configured_channel_ids = [
+            str(value).strip() for value in raw_allowed if str(value).strip()
+        ]
+    else:
+        configured_channel_ids = []
+
     for team_id, client in team_clients.items():
         try:
             cursor: Optional[str] = None
@@ -353,6 +370,36 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
             else:
                 _warn_slack_directory(team_id, str(e))
             continue
+
+    # Resolve configured channels even before they have session history. Try
+    # every workspace client because one multiplexed gateway can serve several
+    # Slack workspaces and a channel ID belongs to exactly one of them.
+    for channel_id in configured_channel_ids:
+        if channel_id in seen_ids:
+            continue
+        for team_id, client in team_clients.items():
+            try:
+                response = await client.conversations_info(channel=channel_id)
+                if not response.get("ok"):
+                    continue
+                channel = response.get("channel", {})
+                name = channel.get("name") or channel.get("name_normalized")
+                if not name:
+                    continue
+                channels.append({
+                    "id": channel_id,
+                    "name": name,
+                    "type": "private" if channel.get("is_private") else "channel",
+                })
+                seen_ids.add(channel_id)
+                break
+            except Exception as error:
+                logger.debug(
+                    "Channel directory: failed to resolve configured Slack channel %s on team %s: %s",
+                    channel_id,
+                    team_id,
+                    error,
+                )
 
     # Merge in DM/group entries discovered from session history.
     # Build a lookup from API-discovered channels so we can enrich session entries.

@@ -170,7 +170,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                busy_policy="dispatch"),
     # Offon — 직원 업무의 빠른 입구. 문법 밖은 자연어로 떨어진다(D-0051).
     CommandDef("todo", "내 Offon 업무 목록", "Info", gateway_only=True),
-    CommandDef("task", "Offon 에 내 업무 등록", "Info",
+    CommandDef("add", "Offon 에 내 업무 등록", "Info",
                gateway_only=True,
                args_hint="[!긴급|!중요|!보통|!낮음] [#프로젝트] <제목>"),
     CommandDef("send", "Offon 업무를 남에게 준다", "Info",

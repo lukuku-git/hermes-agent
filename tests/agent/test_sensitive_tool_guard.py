@@ -77,6 +77,28 @@ def test_telegram_owner_can_write_soul(isolated_home):
     assert not blocked("write_file", {"path": str(isolated_home / "SOUL.md"), "content": "x"})
 
 
+@pytest.mark.parametrize(
+    ("platform", "user_id"),
+    [("telegram", "7000000001"), ("slack", "UADMIN1")],
+)
+def test_configured_admin_can_write_soul(isolated_home, platform, user_id):
+    (isolated_home / "admins.yaml").write_text(
+        CANONICAL_ADMINS.replace("admins: []", f'admins:\n  - {{platform: {platform}, user_id: "{user_id}"}}'),
+        encoding="utf-8",
+    )
+    bind(platform=platform, source="gateway", user_id=user_id)
+    assert not blocked("write_file", {"path": str(isolated_home / "SOUL.md"), "content": "x"})
+
+
+def test_malformed_admin_registry_fails_closed(isolated_home):
+    (isolated_home / "admins.yaml").write_text(
+        CANONICAL_ADMINS.replace("admins: []", 'admins:\n  - {platform: slack, user_id: "UADMIN1"}\n  - invalid'),
+        encoding="utf-8",
+    )
+    bind(platform="slack", source="gateway", user_id="UADMIN1")
+    assert blocked("write_file", {"path": str(isolated_home / "SOUL.md"), "content": "x"})
+
+
 @pytest.mark.parametrize("source", ["cli", "ssh"])
 def test_local_cli_and_ssh_can_write_config(isolated_home, source):
     bind(platform="local", source=source)

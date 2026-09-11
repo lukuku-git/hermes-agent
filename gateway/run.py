@@ -14902,7 +14902,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "profile":
             return await self._handle_profile_command(event)
 
-        if canonical in ("todo", "task", "send"):
+        if canonical in ("todo", "add", "send"):
             # 문법에 맞으면 그 자리에서 답하고, 아니면 자연어 경로가 받는다.
             # 떨어뜨릴 때 command 를 비우는 이유는, 뒤의 quick/plugin/skill
             # 분기가 이름으로 다시 잡아채지 않게 하기 위해서다.
