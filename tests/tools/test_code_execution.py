@@ -453,6 +453,11 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         self.assertNotIn("web_extract(", desc)
         self.assertNotIn("write_file(", desc)
 
+    def test_schema_requires_secrets_in_child_env_not_argv(self):
+        desc = build_execute_code_schema()["description"]
+        self.assertIn("Never put secret values in command arguments", desc)
+        self.assertIn("omit `--token`", desc)
+        self.assertIn("`VERCEL_TOKEN`", desc)
 
     def test_none_defaults_to_all_tools(self):
         schema_none = build_execute_code_schema(None)
