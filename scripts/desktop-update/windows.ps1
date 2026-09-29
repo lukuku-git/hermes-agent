@@ -54,7 +54,8 @@ param(
     [switch]$SelfTestUi,
     [switch]$SelfTestPipeDrain,
     [switch]$SelfTestMarker,
-    [switch]$SelfTestWorkingDirectory
+    [switch]$SelfTestWorkingDirectory,
+    [switch]$SelfTestRelaunchPolicy
 )
 
 if ($PSBoundParameters.ContainsKey("Branch") -and $PSBoundParameters.ContainsKey("Channel")) {
@@ -62,7 +63,7 @@ if ($PSBoundParameters.ContainsKey("Branch") -and $PSBoundParameters.ContainsKey
 }
 $targetArgs = if ($Channel) { @("--channel", $Channel.ToLowerInvariant()) } else { @("--branch", $Branch) }
 
-if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $InstallRoot) {
+if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestRelaunchPolicy -and -not $InstallRoot) {
     # Mandatory in spirit; relaxed in the signature only so the self-test
     # switches can drive the UI / the pipe drain without a checkout.
     throw "-InstallRoot is required"
@@ -645,6 +646,22 @@ function Remove-MarkerIfOwned {
             }
         }
     } catch {}
+}
+
+function Test-SafeToRelaunch([int]$FinalCode, [int]$TargetPid) {
+    # The failure path brings the Desktop back after showing the error --
+    # EXCEPT the desktop-exit timeout (exit 4, #88332): that abort fires only
+    # after watching the ORIGINAL window fail to exit, so the original is
+    # provably still alive and a relaunch here is a deterministic SECOND
+    # instance (two windows fighting over the single-instance lock while
+    # the update never ran). Relaunch only once the original pid is really
+    # gone -- a slow quit that finished between the abort and here leaves
+    # the relaunch safe and wanted. Every other failure code keeps the old
+    # bring-it-back behavior.
+    if ($FinalCode -eq 4 -and $TargetPid -gt 0) {
+        if (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue) { return $false }
+    }
+    return $true
 }
 
 function Start-DesktopRelaunch {
@@ -1520,6 +1537,43 @@ exit 3
     exit 0
 }
 
+# -SelfTestRelaunchPolicy: exit-4 must not relaunch over a live desktop ----
+# #88332 requirement 2: the desktop-exit timeout abort proves the ORIGINAL
+# window is still alive, so relaunching from that failure path spawns a
+# deterministic second instance while the update never ran. Drives the REAL
+# Test-SafeToRelaunch against the real process table with a live child as
+# the stand-in desktop pid. Exits before any marker/desktop machinery, same
+# as the other self-test arms; touches nothing but its own child process.
+if ($SelfTestRelaunchPolicy) {
+    New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $problems = @()
+    $powershell = Join-Path $PSHOME "powershell.exe"
+    $live = Start-Process -FilePath $powershell -ArgumentList "-NoProfile", "-Command", "Start-Sleep -Seconds 60" -WindowStyle Hidden -PassThru
+    try {
+        # Exit 4 + the original pid still alive: the deterministic second
+        # instance -- relaunch must be refused.
+        if (Test-SafeToRelaunch 4 ([int]$live.Id)) { $problems += "exit-4 relaunch was allowed while the desktop pid is alive" }
+        # Exit 4 + the original pid gone (slow quit finished after the
+        # abort): the relaunch is safe and wanted.
+        if (-not (Test-SafeToRelaunch 4 0)) { $problems += "exit-4 relaunch refused with no live desktop pid (slow quit should relaunch)" }
+        # Any other failure code: the old bring-it-back behavior stands.
+        if (-not (Test-SafeToRelaunch 1 ([int]$live.Id))) { $problems += "non-exit-4 failure relaunch refused" }
+        if (-not (Test-SafeToRelaunch 8 ([int]$live.Id))) { $problems += "exit-8 failure relaunch refused" }
+        # Success code: never a failure-path relaunch question, but the
+        # policy must not accidentally block it.
+        if (-not (Test-SafeToRelaunch 0 ([int]$live.Id))) { $problems += "success path was refused a relaunch" }
+    } finally {
+        Stop-Process -Id $live.Id -Force -ErrorAction SilentlyContinue
+    }
+    $detail = "verdicts across (4,live) (4,gone) (1,live) (8,live) (0,live)"
+    if ($problems.Count -gt 0) {
+        Write-Host "RELAUNCH-POLICY SELF-TEST: FAIL $detail -- $($problems -join '; ')"
+        exit 1
+    }
+    Write-Host "RELAUNCH-POLICY SELF-TEST: PASS $detail"
+    exit 0
+}
+
 $savedConsoleInputMode = if ($script:ConsoleInput) { [HermesHandoff.ConsoleInput]::DisableQuickEdit() } else { $null }
 try {
     New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
@@ -1781,7 +1835,11 @@ try {
         if ($finalCode -ne 0) {
             Show-ErrorFinale $finalMsg
             Close-ProgressWindow
-            [void](Start-DesktopRelaunch)
+            if (Test-SafeToRelaunch $finalCode $DesktopPid) {
+                [void](Start-DesktopRelaunch)
+            } else {
+                Write-HandoffLog "skipping failure-path relaunch: the original desktop (pid $DesktopPid) is still alive after the exit-timeout abort -- relaunching would spawn a second instance over the update that never ran (#88332)"
+            }
         } else {
             Publish-UiProgress "Opening Hermes"
             $cameBack = Start-DesktopRelaunch
