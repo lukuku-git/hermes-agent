@@ -134,6 +134,12 @@ _FAILED_CONFIG_RETRY_COOLDOWN_SECONDS = 30.0
 _OPENVIKING_SERVER_LOG_RELATIVE_PATH = Path("logs") / "openviking-server.log"
 _OPENVIKING_RESPONDED_FAILURE_PREFIX = "OpenViking server responded"
 _PENDING_SESSIONS_RELATIVE_DIR = Path("openviking") / "pending_sessions"
+# Explicit memory mirrors that have not landed yet, one directory per actor so a
+# profile never replays another profile's memories into its own namespace.
+_PENDING_MEMORY_WRITES_RELATIVE_DIR = Path("openviking") / "pending_memory_writes"
+# Attempts including the first. The write uses mode "create", so a record whose
+# earlier attempt landed but lost its response keeps failing; the cap drains it.
+_PENDING_MEMORY_WRITE_MAX_ATTEMPTS = 5
 _RUN_LOCKS_RELATIVE_DIR = Path("openviking") / "runs"
 _LEGACY_RECOVERY_LOCK_FILENAME = "legacy-recovery.lock"
 _LOCK_BUSY_ERRNOS = {errno.EWOULDBLOCK, errno.EACCES, errno.EAGAIN}
@@ -2223,6 +2229,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             # Client attached: recover orphaned sessions outside the refresh
             # lock (network I/O), then announce.
             self._recover_pending_sessions()
+            self._recover_pending_memory_writes()
             _emit_runtime_status(status_message, status_callback)
 
     def _handle_runtime_openviking_unreachable(
@@ -2350,6 +2357,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 self._endpoint, self._api_key, self._account, self._user, self._agent,
             )
             self._recover_pending_sessions()
+            self._recover_pending_memory_writes()
 
         # Register as the last active provider for atexit safety net
         global _last_active_provider
@@ -4216,13 +4224,50 @@ class OpenVikingMemoryProvider(MemoryProvider):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Mirror successful built-in memory additions to OpenViking."""
-        if action != "add" or not content or not self._ensure_client():
+        """Mirror successful built-in memory additions to OpenViking.
+
+        The mirror is recorded before the network attempt and cleared only when
+        it lands. A failure used to be logged and forgotten, so the local memory
+        and OpenViking drifted apart without anyone noticing (brain G-0077).
+        """
+        if action != "add" or not content:
             return
 
         subdir = _MEMORY_WRITE_TARGET_SUBDIR_MAP.get(target, _DEFAULT_MEMORY_SUBDIR)
         uri = self._build_memory_uri(subdir)
+        record = self._save_pending_memory_write(
+            {"uri": uri, "content": content, "attempts": 0}
+        )
+        if not self._ensure_client():
+            return
+        self._start_memory_write(uri, content, record)
 
+    def _pending_memory_write_dir(self) -> Optional[Path]:
+        if not self._hermes_home or not self._agent:
+            return None
+        return (
+            Path(self._hermes_home)
+            / _PENDING_MEMORY_WRITES_RELATIVE_DIR
+            / quote(str(self._agent), safe="")
+        )
+
+    def _save_pending_memory_write(self, entry: Dict[str, Any]) -> Optional[Path]:
+        directory = self._pending_memory_write_dir()
+        if directory is None:
+            return None
+        name = quote(entry["uri"].rsplit("/", 1)[-1], safe="")
+        path = directory / f"{name}.json"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            atomic_json_write(path, entry, mode=0o600)
+            return path
+        except Exception as e:
+            logger.warning("Could not record pending OpenViking memory mirror: %s", e)
+            return None
+
+    def _start_memory_write(
+        self, uri: str, content: str, record: Optional[Path]
+    ) -> None:
         def _write():
             try:
                 client = self._new_client()
@@ -4232,7 +4277,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     "mode": "create",
                 })
             except Exception as e:
-                logger.debug("OpenViking memory mirror failed: %s", e)
+                self._note_memory_write_failure(record, e)
+            else:
+                if record is not None:
+                    try:
+                        record.unlink(missing_ok=True)
+                    except Exception as e:
+                        logger.debug("Could not clear pending OpenViking memory mirror: %s", e)
             finally:
                 with self._memory_write_lock:
                     self._memory_write_threads.discard(threading.current_thread())
@@ -4247,6 +4298,40 @@ class OpenVikingMemoryProvider(MemoryProvider):
             except Exception as e:
                 self._memory_write_threads.discard(t)
                 logger.debug("OpenViking memory mirror worker failed to start: %s", e)
+
+    def _note_memory_write_failure(self, record: Optional[Path], error: Exception) -> None:
+        if record is None:
+            logger.warning("OpenViking memory mirror failed and could not be kept: %s", error)
+            return
+        try:
+            entry = json.loads(record.read_text(encoding="utf-8"))
+            attempts = int(entry.get("attempts", 0)) + 1
+            if attempts >= _PENDING_MEMORY_WRITE_MAX_ATTEMPTS:
+                record.unlink(missing_ok=True)
+                logger.warning(
+                    "OpenViking memory mirror %s gave up after %d attempts: %s",
+                    entry.get("uri"), attempts, error,
+                )
+                return
+            atomic_json_write(record, {**entry, "attempts": attempts}, mode=0o600)
+            logger.info("OpenViking memory mirror kept for retry (%d): %s", attempts, error)
+        except Exception as e:
+            logger.warning("Could not update pending OpenViking memory mirror: %s", e)
+
+    def _recover_pending_memory_writes(self) -> None:
+        """Replay this actor's mirrors that never landed. Same URI, same content."""
+        directory = self._pending_memory_write_dir()
+        if directory is None or not directory.is_dir():
+            return
+        for record in sorted(directory.glob("*.json")):
+            try:
+                entry = json.loads(record.read_text(encoding="utf-8"))
+                uri = str(entry["uri"])
+                content = str(entry["content"])
+            except Exception as e:
+                logger.warning("Skipping unreadable pending OpenViking memory mirror %s: %s", record, e)
+                continue
+            self._start_memory_write(uri, content, record)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
