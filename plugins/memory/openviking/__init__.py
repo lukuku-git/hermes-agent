@@ -935,7 +935,11 @@ def _resolve_connection_settings(provider_config: Optional[dict] = None) -> dict
         "api_key": api_key_env if api_key_env is not None else ovcli_values.get("api_key", ""),
         "account": account_env if account_env is not None else ovcli_values.get("account", ""),
         "user": user_env if user_env is not None else ovcli_values.get("user", ""),
-        "agent": _first_nonempty(agent_env, ovcli_values.get("agent"), default=_DEFAULT_AGENT),
+        # Profiles share a gateway process, so their actor must win over its env.
+        "agent": _first_nonempty(
+            _clean_config_value(provider_config.get("agent")),
+            agent_env, ovcli_values.get("agent"), default=_DEFAULT_AGENT,
+        ),
     }
 
 
