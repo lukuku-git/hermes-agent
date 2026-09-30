@@ -240,8 +240,16 @@ def _vat_pointers(arguments, result, workspace_root):
         if not match or match[2] not in _STATUSES:
             continue
         path = lines[index + 1].strip()
+        record_path = re.match(
+            r"(?:decisions|facts|goals|gaps|definitions|policies)/"
+            + re.escape(match[1]) + r"(?:-|\.)", path,
+        )
+        memory_path = match[1].startswith("M-") and re.fullmatch(
+            r"memory/[0-9]{4}-(?:0[1-9]|1[0-2])/"
+            + re.escape(match[1]) + r"(?:-[\w-]+)?\.md", path,
+        )
         if (_SENSITIVE.search(path) or not re.fullmatch(r"[\w/-]+\.md", path)
-                or not re.match(r"(?:decisions|facts|goals|gaps|definitions|policies)/" + re.escape(match[1]) + r"(?:-|\.)", path)
+                or not (record_path or memory_path)
                 or ".." in path):
             continue
         pointers.append(f"brain {match[1]}({match[2]})")

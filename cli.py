@@ -2943,6 +2943,18 @@ def _terminal_width_for_streaming() -> int:
     return max(20, cols - len(_STREAM_PAD) - 2)
 
 
+def _finalize_cli_response(result, *, text=None):
+    """Runtime output only: never replace the stored model text or messages."""
+    from agent.execution_receipts import format_receipt_response
+
+    if isinstance(result, dict):
+        return format_receipt_response(
+            (result.get("final_response") or "") if text is None else text,
+            result.get("tool_execution_results"),
+        )
+    return format_receipt_response(str(result) if result is not None else "", None)
+
+
 def _render_final_assistant_content(text: str, mode: str = "render"):
     """Render final assistant content as markdown, stripped text, or raw text."""
     from rich.markdown import Markdown
@@ -6771,6 +6783,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _emit_stream_text(self, text: str) -> None:
         """Emit filtered text to the streaming display."""
+        # Model content is not provenance. Keep reasoning/tool activity live,
+        # but render the final text once, through the existing final panel.
+        if getattr(self, "_defer_final_text", False):
+            return
         if not text:
             return
 
@@ -13820,6 +13836,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             result = None
 
             # Reset streaming display state for this turn
+            self._defer_final_text = True
             self._reset_stream_state()
             # Separate from _reset_stream_state because this must persist
             # across intermediate turn boundaries (tool-calling loops) — only
@@ -13872,7 +13889,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # callback when streaming is disabled, so the TTS consumer
                 # becomes the sole display path.
                 _tts_display_cb = None
-                if not self.streaming_enabled:
+                if not self.streaming_enabled and not self._defer_final_text:
                     def display_callback(sentence: str):
                         """Called by TTS consumer when a sentence is ready to display + speak."""
                         nonlocal _streaming_box_opened
@@ -14304,7 +14321,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 except Exception:
                     pass
 
-            response_previewed = result.get("response_previewed", False) if result else False
+            # Finalize after runtime interruption/error text, outside the stored
+            # model transcript. A suppressed preview still needs the final panel.
+            response = _finalize_cli_response(result, text=response)
+            response_previewed = (
+                (result.get("response_previewed", False) if result else False)
+                and not self._defer_final_text
+            )
 
             # Display reasoning (thinking) box if enabled and available.
             # Skip when streaming already showed reasoning live.  Use the
@@ -17925,7 +17948,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             and cli.agent.session_id != cli.session_id
         ):
             cli.session_id = cli.agent.session_id
-        resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
+        resp = _finalize_cli_response(result)
         if resp:
             print(resp)
         return resp or ""
@@ -18399,7 +18422,7 @@ def main(
                             and cli.agent.session_id != cli.session_id
                         ):
                             cli.session_id = cli.agent.session_id
-                        response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        response = _finalize_cli_response(result)
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
                         # interactive CLI path. Write to stderr so piped stdout

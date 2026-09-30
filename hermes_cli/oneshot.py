@@ -455,7 +455,12 @@ def _run_agent(
         agent.tool_gen_callback = None
 
         result = agent.run_conversation(prompt)
-        return (result.get("final_response") or "", result)
+        from agent.execution_receipts import format_receipt_response
+
+        response = format_receipt_response(
+            result.get("final_response") or "", result.get("tool_execution_results"),
+        )
+        return (response, result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,
         # NOT cli.py:_run_cleanup — oneshot has no _active_agent_ref and must
