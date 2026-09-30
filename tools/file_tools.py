@@ -1300,6 +1300,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                     "file_size": os.path.getsize(_resolved),
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
+                    "resolved_path": str(_resolved),
                 }
                 if result_dict["truncated"]:
                     result_dict["hint"] = (
@@ -1428,6 +1429,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
+        if not result_dict.get("error"):
+            # Resolved by this task's read handler, not the gateway process cwd.
+            result_dict["resolved_path"] = str(_resolved)
 
         # ── Populate negative-result cache on not-found ───────────────
         # _suggest_similar_files returns ReadResult(error="File not found: ..").

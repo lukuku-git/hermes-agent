@@ -1352,15 +1352,22 @@ def handle_function_call(
                         session_id=session_id,
                         user_task=user_task,
                     )
+            def _recorded_dispatch(next_args: Dict[str, Any]) -> Any:
+                # Bind identity only. The registry records after the actual
+                # handler returns; middleware short-circuits, unknown tools and
+                # transformed results cannot manufacture executions.
+                from agent.execution_receipts import execution_call_scope
+                with execution_call_scope(tool_call_id):
+                    return _dispatch(next_args)
             if skip_tool_execution_middleware:
-                result = _dispatch(function_args)
+                result = _recorded_dispatch(function_args)
             else:
                 from hermes_cli.middleware import run_tool_execution_middleware
 
                 result = run_tool_execution_middleware(
                     function_name,
                     function_args,
-                    _dispatch,
+                    _recorded_dispatch,
                     original_args=_tool_original_args,
                     task_id=task_id or "",
                     session_id=session_id or "",

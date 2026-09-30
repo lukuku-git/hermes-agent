@@ -7567,6 +7567,8 @@ class AIAgent:
             start_task_run,
         )
         from agent.subagent_lifecycle import bind_subagent_parent
+        from agent.execution_receipts import ToolExecutionCollector
+        execution_collector = ToolExecutionCollector()
         effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")
         task_context = {
@@ -7628,7 +7630,7 @@ class AIAgent:
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            with execution_collector.activate(), bind_subagent_parent(self), scoped_runtime_main({}):
                 result = run_conversation(
                     self,
                     user_message,
@@ -7642,6 +7644,8 @@ class AIAgent:
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
                 )
+            if isinstance(result, dict):
+                result["tool_execution_results"] = execution_collector.snapshot()
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"

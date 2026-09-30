@@ -5806,3 +5806,37 @@ class TestMemoryContextSanitization:
         assert "how is the honcho working" in result
 
 
+def test_current_execution_receipts_reset_each_run_and_survive_transcript_pruning(agent, monkeypatch):
+    """Exercise the public run boundary, not an offset-based transcript parser."""
+    from model_tools import handle_function_call
+    from tools.registry import registry
+
+    calls = []
+    raw = json.dumps({"content": "1|fixture", "total_lines": 1,
+                      "file_size": 7, "truncated": False})
+
+    def loop(_agent, *_args, **_kwargs):
+        if not calls:
+            handle_function_call(
+                "read_file", {"path": "AGENTS.md"}, tool_call_id="this-run",
+                skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+        calls.append(True)
+        # Compression/pruning replaced messages and reset history_offset.
+        return {"final_response": "answer", "completed": True,
+                "messages": [{"role": "tool", "tool_call_id": "old-run",
+                              "content": "old transcript fake receipt"}],
+                "history_offset": 0}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", loop)
+    with patch.object(registry.get_entry("read_file"), "handler", return_value=raw):
+        first = agent.run_conversation("first")
+        second = agent.run_conversation("second", conversation_history=first["messages"])
+    assert first["tool_execution_results"] == [
+        {"tool_call_id": "this-run", "name": "read_file",
+         "arguments": {"path": "AGENTS.md"}, "result": raw},
+    ]
+    assert second["tool_execution_results"] == []
+
+

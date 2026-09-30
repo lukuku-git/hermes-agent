@@ -4399,6 +4399,12 @@ class TurnRunner:
         )
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
+        # Receipt-governed platforms must finalize before text delivery: a
+        # model-authored receipt streamed early cannot be unsent by a sanitizer.
+        _receipt_governed = ctx.source.platform in {Platform.SLACK, Platform.TELEGRAM}
+        if _receipt_governed:
+            _want_stream_deltas = False
+            _want_interim_messages = False
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -4439,13 +4445,13 @@ class TurnRunner:
         # When text streaming is off but streaming TTS is active,
         # install a TTS-only delta callback so the consumer still
         # receives LLM deltas for audio synthesis (#60671).
-        if _stream_delta_cb is None and _stts_consumer_ref is not None:
+        if _stream_delta_cb is None and _stts_consumer_ref is not None and not _receipt_governed:
             def _stream_delta_cb(text: str) -> None:
                 if ctx._run_still_current():
                     _stts_consumer_ref.on_delta(text)
 
         def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-            if not ctx._run_still_current():
+            if _receipt_governed or not ctx._run_still_current():
                 return
             display_text = text
             if _stream_consumer is not None:
@@ -5638,6 +5644,9 @@ class TurnRunner:
             "final_response": final_response,
             "last_reasoning": result.get("last_reasoning"),
             "messages": ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else [],
+            # Never derive receipts from messages/history_offset: compression
+            # and pruning can replace that transcript with historical content.
+            "tool_execution_results": result.get("tool_execution_results"),
             "api_calls": ctx.result_holder[0].get("api_calls", 0) if ctx.result_holder[0] else 0,
             "transport_calls": ctx.result_holder[0].get("transport_calls", 0) if ctx.result_holder[0] else 0,
             "gateway_route": ctx.result_holder[0].get("gateway_route", ctx.route_mode) if ctx.result_holder[0] else ctx.route_mode,
@@ -17472,6 +17481,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_result, response, history_len=len(history),
                 )
                 response = _sanitize_gateway_final_response(source.platform, response)
+                from agent.execution_receipts import strip_model_receipt_lines
+                response = strip_model_receipt_lines(response)
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -17585,6 +17596,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
+
+            if not _intentional_silence and source.platform in {Platform.SLACK, Platform.TELEGRAM}:
+                from agent.execution_receipts import format_receipt_response
+                response = format_receipt_response(
+                    response, agent_result.get("tool_execution_results"),
+                )
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {

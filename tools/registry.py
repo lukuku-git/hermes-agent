@@ -746,12 +746,17 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
+            from copy import deepcopy
+            from agent.execution_receipts import record_tool_execution
+            executed_args = deepcopy(args)
             if entry.is_async:
                 from model_tools import _run_async
                 result = _run_async(entry.handler(args, **kwargs))
             else:
                 result = entry.handler(args, **kwargs)
-            return self._normalize_handler_result(name, result)
+            result = self._normalize_handler_result(name, result)
+            record_tool_execution(name, executed_args, result)
+            return result
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             # Route through the sanitizer so framing tokens / CDATA / fences
