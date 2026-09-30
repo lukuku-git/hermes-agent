@@ -617,6 +617,53 @@ def _is_allowlisted_autonomous_deploy(command: str, home: Path) -> bool:
     )
 
 
+def _is_autonomous_deploy_context() -> bool:
+    """Return whether this call is from the cron/autonomous execution path."""
+    from gateway.session_context import get_session_env
+
+    source = get_session_env("HERMES_SESSION_SOURCE", "").strip().lower()
+    cron = get_session_env("HERMES_CRON_SESSION", "").strip()
+    return source == "autonomous" or (source == "cron" and cron == "1")
+
+
+def _is_allowlisted_autonomous_bootstrap(command: str, home: Path) -> bool:
+    """Match one exact bootstrap of an allowlisted per-user LaunchAgent plist."""
+    label_prefixes = _autonomous_deploy_label_prefixes(home)
+    if not label_prefixes or not _is_autonomous_deploy_context():
+        return False
+
+    normalized = command.replace(
+        "gui/$(id -u)",
+        f"gui/{_AUTONOMOUS_DEPLOY_UID_SENTINEL}",
+    )
+    if "$" in normalized or "`" in normalized:
+        return False
+    try:
+        tokens = shlex.split(normalized, posix=True)
+    except ValueError:
+        return False
+    if len(tokens) != 4 or tokens[:2] != ["launchctl", "bootstrap"]:
+        return False
+    if tokens[2] != f"gui/{_AUTONOMOUS_DEPLOY_UID_SENTINEL}":
+        return False
+
+    plist_path = Path(tokens[3])
+    launchagents_dir = Path.home() / "Library" / "LaunchAgents"
+    if not plist_path.is_absolute() or plist_path.parent != launchagents_dir:
+        return False
+    if not plist_path.name.endswith(".plist"):
+        return False
+    label = plist_path.name.removesuffix(".plist")
+    label_lower = label.lower()
+    return bool(
+        _AUTONOMOUS_DEPLOY_LABEL_RE.fullmatch(label)
+        and "gateway" not in label_lower
+        and "restart_loop_guard" not in label_lower
+        and "restart-loop-guard" not in label_lower
+        and any(label.startswith(prefix) for prefix in label_prefixes)
+    )
+
+
 def _sensitive_tool_block_reason(
     function_name: str, function_args: dict[str, Any]
 ) -> str | None:
@@ -680,10 +727,12 @@ def _sensitive_tool_block_reason(
 
     if not sensitive:
         return None
-    if function_name == "terminal" and _is_allowlisted_autonomous_deploy(
-        str(function_args.get("command", "")), home
-    ):
-        return None
+    if function_name == "terminal":
+        command = str(function_args.get("command", ""))
+        if _is_allowlisted_autonomous_deploy(command, home) or (
+            _is_allowlisted_autonomous_bootstrap(command, home)
+        ):
+            return None
     if unprovable_admins_mutation:
         return (
             "admins.yaml 소유자 항목은 terminal/execute_code에서 안전하게 검증할 수 없어 변경할 수 없습니다. "

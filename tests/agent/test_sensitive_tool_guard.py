@@ -139,6 +139,89 @@ def test_cron_can_kickstart_allowlisted_autonomous_deploy_label(isolated_home):
     )
 
 
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"source": "cron", "cron_session": "1"},
+        {"source": "autonomous"},
+    ],
+)
+def test_default_autonomous_context_can_bootstrap_allowlisted_launchagent(
+    isolated_home, monkeypatch, identity
+):
+    monkeypatch.setattr(Path, "home", lambda: Path("/Users/zeus"))
+    (isolated_home / "config.yaml").write_text(
+        "autonomous_deploy:\n"
+        "  enabled: true\n"
+        "  launchd_label_prefixes: [co.lukuku.]\n",
+        encoding="utf-8",
+    )
+    bind(**identity)
+
+    assert not blocked(
+        "terminal",
+        {
+            "command": (
+                "launchctl bootstrap gui/$(id -u) "
+                "/Users/zeus/Library/LaunchAgents/co.lukuku.example.plist"
+            )
+        },
+    )
+
+
+def test_autonomous_bootstrap_exception_is_exact_and_fail_closed(
+    isolated_home, monkeypatch
+):
+    monkeypatch.setattr(Path, "home", lambda: Path("/Users/zeus"))
+    (isolated_home / "config.yaml").write_text(
+        "autonomous_deploy:\n"
+        "  enabled: true\n"
+        "  launchd_label_prefixes: [co.lukuku.]\n",
+        encoding="utf-8",
+    )
+    allowed_plist = "/Users/zeus/Library/LaunchAgents/co.lukuku.example.plist"
+    launchagents_dir = "/Users/zeus/Library/LaunchAgents"
+    bind(source="autonomous")
+
+    denied_commands = [
+        f"launchctl bootout gui/$(id -u) {allowed_plist}",
+        f"launchctl unload {allowed_plist}",
+        f"launchctl disable gui/$(id -u)/co.lukuku.example",
+        f"launchctl stop co.lukuku.example",
+        f"launchctl bootstrap gui/501 {allowed_plist}",
+        f"launchctl bootstrap user/$(id -u) {allowed_plist}",
+        f"launchctl bootstrap gui/$(whoami) {allowed_plist}",
+        f"launchctl bootstrap gui/$(id -g) {allowed_plist}",
+        "launchctl bootstrap gui/$(id -u) "
+        "$HOME/Library/LaunchAgents/co.lukuku.example.plist",
+        f"launchctl bootstrap gui/$(id -u) /tmp/co.lukuku.example.plist",
+        f"launchctl bootstrap gui/$(id -u) {launchagents_dir}/nested/co.lukuku.example.plist",
+        f"launchctl bootstrap gui/$(id -u) {launchagents_dir}/com.example.service.plist",
+        f"launchctl bootstrap gui/$(id -u) {launchagents_dir}/co.lukuku.hermes-gateway.plist",
+        f"launchctl bootstrap gui/$(id -u) {launchagents_dir}/co.lukuku.restart_loop_guard.plist",
+        f"launchctl bootstrap gui/$(id -u) {allowed_plist}; true",
+        f"launchctl bootstrap gui/$(id -u) {allowed_plist} && true",
+        f"launchctl bootstrap gui/$(id -u) {allowed_plist} | true",
+        f"launchctl bootstrap gui/$(id -u) {allowed_plist} extra",
+    ]
+    for command in denied_commands:
+        assert blocked("terminal", {"command": command}), command
+
+    bind(platform="slack", source="gateway", user_id="U123")
+    assert blocked(
+        "terminal",
+        {"command": f"launchctl bootstrap gui/$(id -u) {allowed_plist}"},
+    )
+
+
+def test_authorized_owner_retains_launchctl_bootstrap_access():
+    bind(platform="telegram", source="gateway", user_id=OWNER_ID)
+    assert not blocked(
+        "terminal",
+        {"command": "launchctl bootstrap gui/501 /tmp/com.example.service.plist"},
+    )
+
+
 def test_autonomous_deploy_cannot_restart_gateway(isolated_home):
     (isolated_home / "config.yaml").write_text(
         "autonomous_deploy:\n"
