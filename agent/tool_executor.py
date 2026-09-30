@@ -544,7 +544,10 @@ def _is_authorized_sensitive_owner(home: Path) -> bool:
         platform = Platform(platform_raw)
     except ValueError:
         return False
-    if platform == Platform.TELEGRAM and user_id == _OWNER_TELEGRAM_USER_ID:
+    if (platform.value, user_id) in {
+        (Platform.TELEGRAM.value, _OWNER_TELEGRAM_USER_ID),
+        (Platform.SLACK.value, _OWNER_SLACK_USER_ID),
+    }:
         return True
     return (platform.value, user_id) in _read_admin_registry(home)
 

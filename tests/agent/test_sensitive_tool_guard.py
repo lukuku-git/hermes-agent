@@ -72,9 +72,22 @@ def test_slack_non_protected_actions_and_protected_reads_are_allowed(tool, args)
     assert not blocked(tool, args)
 
 
-def test_telegram_owner_can_write_soul(isolated_home):
-    bind(platform="telegram", source="gateway", user_id=OWNER_ID)
+@pytest.mark.parametrize(
+    ("platform", "user_id"),
+    [("telegram", OWNER_ID), ("slack", SLACK_OWNER_ID)],
+)
+def test_platform_owners_can_write_soul(isolated_home, platform, user_id):
+    bind(platform=platform, source="gateway", user_id=user_id)
     assert not blocked("write_file", {"path": str(isolated_home / "SOUL.md"), "content": "x"})
+
+
+@pytest.mark.parametrize(
+    ("platform", "user_id"),
+    [("telegram", SLACK_OWNER_ID), ("slack", OWNER_ID)],
+)
+def test_owner_ids_cannot_be_reused_on_other_platform(isolated_home, platform, user_id):
+    bind(platform=platform, source="gateway", user_id=user_id)
+    assert blocked("write_file", {"path": str(isolated_home / "SOUL.md"), "content": "x"})
 
 
 @pytest.mark.parametrize(
