@@ -324,10 +324,12 @@ _GATEWAY_CONTROL_RE = re.compile(
     r"\bhermes\s+gateway\s+(?:restart|stop|start)\b|"
     r"\b(?:kill|pkill)\b[^\n;&|]*(?:gateway|gateway\.pid)|"
     r"(?:gateway\.(?:pid|lock))[^\n;&|]*(?:rm|unlink|truncate|>|write)|"
-    r"\b(?:launchctl|systemctl|service)\b[^\n;&|]*(?:load|unload|enable|disable|"
-    r"start|stop|restart|bootstrap|bootout)",
+    r"\b(?:launchctl|systemctl|service)\b[^\n;&|]*\b(?:load|unload|enable|disable|"
+    r"kickstart|start|stop|restart|bootstrap|bootout)\b",
     re.IGNORECASE,
 )
+_AUTONOMOUS_DEPLOY_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_AUTONOMOUS_DEPLOY_UID_SENTINEL = "__HERMES_CURRENT_UID__"
 
 
 def _read_admin_registry(home: Path) -> frozenset[tuple[str, str]]:
@@ -547,6 +549,74 @@ def _is_authorized_sensitive_owner(home: Path) -> bool:
     return (platform.value, user_id) in _read_admin_registry(home)
 
 
+def _autonomous_deploy_label_prefixes(home: Path) -> tuple[str, ...]:
+    """Read the default profile's explicit autonomous launchd allowlist."""
+    from hermes_constants import get_default_hermes_root
+
+    if home != get_default_hermes_root().expanduser().resolve(strict=False):
+        return ()
+    try:
+        import yaml
+
+        document = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    except Exception:
+        return ()
+    section = document.get("autonomous_deploy") if isinstance(document, dict) else None
+    if not isinstance(section, dict) or section.get("enabled") is not True:
+        return ()
+    prefixes = section.get("launchd_label_prefixes")
+    if not isinstance(prefixes, list) or not prefixes:
+        return ()
+    if any(not isinstance(prefix, str) or not prefix for prefix in prefixes):
+        return ()
+    return tuple(prefixes)
+
+
+def _is_allowlisted_autonomous_deploy(command: str, home: Path) -> bool:
+    """Match one exact launchctl kickstart invocation without shell syntax."""
+    label_prefixes = _autonomous_deploy_label_prefixes(home)
+    if not label_prefixes:
+        return False
+
+    normalized = command
+    for domain in ("gui", "user"):
+        normalized = normalized.replace(
+            f"{domain}/$(id -u)/",
+            f"{domain}/{_AUTONOMOUS_DEPLOY_UID_SENTINEL}/",
+        )
+    if "$" in normalized or "`" in normalized:
+        return False
+    try:
+        tokens = shlex.split(normalized, posix=True)
+    except ValueError:
+        return False
+    if len(tokens) == 4 and tokens[:3] == ["launchctl", "kickstart", "-k"]:
+        target = tokens[3]
+    elif len(tokens) == 3 and tokens[:2] == ["launchctl", "kickstart"]:
+        target = tokens[2]
+    else:
+        return False
+
+    target_parts = target.split("/")
+    if len(target_parts) == 3 and target_parts[0] in {"gui", "user"}:
+        uid = target_parts[1]
+        domain_valid = bool(re.fullmatch(r"[0-9]+", uid)) or (
+            uid == _AUTONOMOUS_DEPLOY_UID_SENTINEL
+        )
+        label = target_parts[2]
+    else:
+        return False
+    label_lower = label.lower()
+    return bool(
+        domain_valid
+        and _AUTONOMOUS_DEPLOY_LABEL_RE.fullmatch(label)
+        and "gateway" not in label_lower
+        and "restart_loop_guard" not in label_lower
+        and "restart-loop-guard" not in label_lower
+        and any(label.startswith(prefix) for prefix in label_prefixes)
+    )
+
+
 def _sensitive_tool_block_reason(
     function_name: str, function_args: dict[str, Any]
 ) -> str | None:
@@ -609,6 +679,10 @@ def _sensitive_tool_block_reason(
         unprovable_admins_mutation = sensitive and _code_mentions_admins_path(code, home)
 
     if not sensitive:
+        return None
+    if function_name == "terminal" and _is_allowlisted_autonomous_deploy(
+        str(function_args.get("command", "")), home
+    ):
         return None
     if unprovable_admins_mutation:
         return (

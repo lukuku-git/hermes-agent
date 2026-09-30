@@ -110,6 +110,87 @@ def test_cron_cannot_write_soul(isolated_home):
     assert blocked("write_file", {"path": str(isolated_home / "SOUL.md"), "content": "x"})
 
 
+def test_cron_can_kickstart_allowlisted_autonomous_deploy_label(isolated_home):
+    (isolated_home / "config.yaml").write_text(
+        "autonomous_deploy:\n"
+        "  enabled: true\n"
+        "  launchd_label_prefixes: [co.lukuku.]\n",
+        encoding="utf-8",
+    )
+    identities = [
+        {"source": "cron", "cron_session": "1"},
+        {"source": "autonomous"},
+        {"platform": "slack", "source": "gateway", "user_id": "U123"},
+        {"platform": "telegram", "source": "gateway", "user_id": "7000000001"},
+    ]
+    for identity in identities:
+        bind(**identity)
+        assert not blocked(
+            "terminal",
+            {
+                "command": (
+                    "launchctl kickstart gui/$(id -u)/co.lukuku.openviking-sync"
+                )
+            },
+        )
+    assert not blocked(
+        "terminal",
+        {"command": "launchctl kickstart gui/501/co.lukuku.openviking-sync"},
+    )
+
+
+def test_autonomous_deploy_cannot_restart_gateway(isolated_home):
+    (isolated_home / "config.yaml").write_text(
+        "autonomous_deploy:\n"
+        "  enabled: true\n"
+        "  launchd_label_prefixes: [co.lukuku.]\n",
+        encoding="utf-8",
+    )
+    bind(source="autonomous")
+
+    denied_commands = [
+        "launchctl kickstart gui/$(id -u)/ai.hermes.gateway",
+        "launchctl kickstart gui/$(id -u)/co.lukuku.hermes-gateway",
+        "launchctl kickstart gui/$(id -u)/co.lukuku.restart_loop_guard",
+        "launchctl kickstart gui/$(id -u)/com.example.service",
+        "launchctl kickstart gui/$(id -u)/co.lukuku.openviking-sync; true",
+        "launchctl kickstart gui/$(whoami)/co.lukuku.openviking-sync",
+        "launchctl kickstart gui/$(id -g)/co.lukuku.openviking-sync",
+        "printf 'launchctl kickstart gui/$(id -u)/co.lukuku.openviking-sync'",
+    ]
+    for command in denied_commands:
+        assert blocked("terminal", {"command": command})
+
+
+def test_autonomous_deploy_cannot_mutate_protected_config(isolated_home):
+    bind(source="autonomous")
+    assert blocked(
+        "terminal",
+        {"command": "launchctl kickstart gui/501/co.lukuku.openviking-sync"},
+    )
+
+    (isolated_home / "config.yaml").write_text(
+        "autonomous_deploy:\n  enabled: true\n",
+        encoding="utf-8",
+    )
+    assert blocked(
+        "terminal",
+        {"command": "launchctl kickstart gui/501/co.lukuku.openviking-sync"},
+    )
+
+    (isolated_home / "config.yaml").write_text(
+        "autonomous_deploy:\n"
+        "  enabled: true\n"
+        "  launchd_label_prefixes: [co.lukuku.]\n",
+        encoding="utf-8",
+    )
+
+    assert blocked(
+        "write_file",
+        {"path": str(isolated_home / "config.yaml"), "content": "security: {}\n"},
+    )
+
+
 def test_unset_identity_cannot_write_soul(isolated_home):
     clear_session_vars([])
     assert blocked("write_file", {"path": str(isolated_home / "SOUL.md"), "content": "x"})

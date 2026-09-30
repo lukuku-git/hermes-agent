@@ -28,6 +28,13 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    # Narrow sensitive-gate exception for exact launchctl kickstarts. Both the
+    # opt-in and at least one explicit label prefix are required in the default
+    # profile; named profiles and omitted settings fail closed.
+    "autonomous_deploy": {
+        "enabled": False,
+        "launchd_label_prefixes": [],
+    },
     "agent": {
         "max_turns": 500,
         # Optional deterministic gateway split. Disabled by default: only
