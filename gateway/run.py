@@ -13217,6 +13217,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        set_profile_name = getattr(adapter, "set_profile_name", None)
+        if callable(set_profile_name):
+            set_profile_name(profile_name)
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -13558,6 +13561,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # this reaches ALL platforms (not just the ones that
                     # pre-declared it), making profile routing platform-generic.
                     adapter.gateway_runner = self
+                    set_profile_name = getattr(adapter, "set_profile_name", None)
+                    if callable(set_profile_name):
+                        set_profile_name(self._active_profile_name())
                     return adapter
                 # Registered but failed to instantiate — don't silently fall
                 # through to built-ins (there are none for plugin platforms).

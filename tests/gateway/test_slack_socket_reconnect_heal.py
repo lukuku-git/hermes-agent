@@ -13,7 +13,9 @@ from outliving a teardown.
 """
 
 import asyncio
+import logging
 import sys
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -272,6 +274,92 @@ class TestSocketModeTeardown:
 
 
 class TestSocketModeRestart:
+
+    @staticmethod
+    def _stop_after_watchdog_polls(adapter, polls: int):
+        calls = 0
+
+        async def _sleep(_delay):
+            nonlocal calls
+            calls += 1
+            if calls > polls:
+                adapter._running = False
+
+        return _sleep
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("connected", "ping_stale"),
+        [(False, False), (True, True)],
+        ids=["transport-false", "ping-stale"],
+    )
+    async def test_new_live_handler_gets_first_ping_grace(
+        self, adapter, connected, ping_stale
+    ):
+        """A replacement socket gets time to connect and receive its first ping."""
+        live_task = MagicMock()
+        live_task.done.return_value = False
+        adapter._socket_mode_task = live_task
+        adapter._handler = MagicMock()
+        adapter._socket_handler_started_monotonic = time.monotonic()
+        adapter._socket_transport_connected = AsyncMock(return_value=connected)
+        adapter._socket_ping_pong_stale = MagicMock(return_value=ping_stale)
+        adapter._restart_socket_mode = AsyncMock()
+
+        with patch.object(
+            _slack_mod.asyncio,
+            "sleep",
+            side_effect=self._stop_after_watchdog_polls(adapter, 1),
+        ):
+            await adapter._socket_watchdog_loop()
+
+        adapter._restart_socket_mode.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_first_ping_grace_does_not_hide_completed_socket_task(self, adapter):
+        dead_task = MagicMock()
+        dead_task.done.return_value = True
+        adapter._socket_mode_task = dead_task
+        adapter._socket_handler_started_monotonic = time.monotonic()
+
+        reasons: list[str] = []
+
+        async def _fake_restart(reason: str) -> None:
+            reasons.append(reason)
+            adapter._running = False
+
+        adapter._restart_socket_mode = _fake_restart
+        adapter._socket_watchdog_interval_s = 0
+
+        await adapter._socket_watchdog_loop()
+
+        assert reasons == ["socket task stopped"]
+
+    @pytest.mark.asyncio
+    async def test_reconnect_success_log_is_profile_tagged_and_emitted_once(
+        self, adapter, caplog
+    ):
+        live_task = MagicMock()
+        live_task.done.return_value = False
+        adapter._socket_mode_task = live_task
+        adapter._handler = MagicMock()
+        adapter.set_profile_name("observer")
+        adapter._socket_reconnect_pending = True
+        adapter._socket_transport_connected = AsyncMock(return_value=True)
+        adapter._socket_ping_pong_stale = MagicMock(return_value=False)
+        adapter._restart_socket_mode = AsyncMock()
+
+        with caplog.at_level(logging.INFO), patch.object(
+            _slack_mod.asyncio,
+            "sleep",
+            side_effect=self._stop_after_watchdog_polls(adapter, 2),
+        ):
+            await adapter._socket_watchdog_loop()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert messages.count(
+            "[Slack] Socket Mode reconnected (profile: observer)"
+        ) == 1
 
 
     @pytest.mark.asyncio

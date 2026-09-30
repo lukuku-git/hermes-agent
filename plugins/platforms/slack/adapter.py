@@ -897,6 +897,10 @@ class SlackAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SLACK)
+        # The runner overwrites this for both primary and multiplexed secondary
+        # adapters before connect.  Keeping a safe default also gives standalone
+        # adapter users stable, profile-tagged transport evidence.
+        self._profile_name = "default"
         self._app: Optional[Any] = None
         self._handler: Optional[Any] = None
         self._bot_user_id: Optional[str] = None
@@ -1030,6 +1034,10 @@ class SlackAdapter(BasePlatformAdapter):
         self._proxy_url: Optional[str] = None
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
+        # Set only after a watchdog replacement handler is started.  The next
+        # positive transport probe consumes it and emits one durable recovery
+        # record for the external process watchdog.
+        self._socket_reconnect_pending = False
         self._socket_watchdog_interval_s = 15.0
         # Monotonic timestamp of the most recent Socket Mode handler (re)start,
         # used to grant a grace window for the first ping/pong after connect.
@@ -1041,6 +1049,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Allow at least this long after (re)connect before treating a missing
         # first ping/pong as evidence of a wedged transport.
         self._socket_first_ping_grace_s = 60.0
+
+    def set_profile_name(self, profile_name: str) -> None:
+        """Bind transport-health logs to the owning gateway profile."""
+        if profile_name:
+            self._profile_name = profile_name
 
     async def _close_workspace_clients(self) -> None:
         """Close any Slack SDK clients that may own aiohttp sessions."""
@@ -1280,6 +1293,19 @@ class SlackAdapter(BasePlatformAdapter):
             return False
         return (time.time() - last) > (ping_interval * self._socket_ping_stale_factor)
 
+    def _socket_handler_in_first_ping_grace(self) -> bool:
+        """Whether the current live handler is still in its startup grace."""
+        task = self._socket_mode_task
+        started = self._socket_handler_started_monotonic
+        if task is None or task.done() or started is None:
+            return False
+        grace = self._socket_first_ping_grace_s
+        client = getattr(self._handler, "client", None)
+        ping_interval = getattr(client, "ping_interval", None)
+        if isinstance(ping_interval, (int, float)) and ping_interval > 0:
+            grace = max(grace, ping_interval * 2)
+        return (time.monotonic() - started) <= grace
+
     async def _restart_socket_mode(self, reason: str) -> None:
         """Reconnect Socket Mode without rebuilding adapter state."""
         if not self._running:
@@ -1289,11 +1315,16 @@ class SlackAdapter(BasePlatformAdapter):
             if not self._running or not self._app or not self._app_token:
                 return
 
-            logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
+            logger.warning(
+                "[Slack] Socket Mode unhealthy (%s); reconnecting (profile: %s)",
+                reason,
+                self._profile_name,
+            )
             await self._stop_socket_mode_handler()
 
             try:
                 self._start_socket_mode_handler()
+                self._socket_reconnect_pending = True
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error(
                     "[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True
@@ -1322,9 +1353,16 @@ class SlackAdapter(BasePlatformAdapter):
                     continue
 
                 connected = await self._socket_transport_connected()
-                if connected is False:
+                in_grace = self._socket_handler_in_first_ping_grace()
+                if connected is True and self._socket_reconnect_pending:
+                    logger.info(
+                        "[Slack] Socket Mode reconnected (profile: %s)",
+                        self._profile_name,
+                    )
+                    self._socket_reconnect_pending = False
+                if connected is False and not in_grace:
                     await self._restart_socket_mode("transport disconnected")
-                elif self._socket_ping_pong_stale():
+                elif self._socket_ping_pong_stale() and not in_grace:
                     # is_connected() can lie when the aiohttp session is closed
                     # but the client keeps retrying; ping/pong staleness catches
                     # that wedged-zombie case that the bool check above misses.
