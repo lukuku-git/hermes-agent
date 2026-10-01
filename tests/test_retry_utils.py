@@ -208,3 +208,25 @@ class TestParseRetryAfterSeconds:
                 raise RuntimeError("boom")
 
         assert parse_retry_after_seconds(Explosive()) is None
+
+
+class TestLocalAdapterBusy:
+    @staticmethod
+    def _err(status, message):
+        from types import SimpleNamespace
+        return SimpleNamespace(status_code=status, message=message, body=None, response=None)
+
+    def test_loopback_busy_is_a_queue(self):
+        from agent.retry_utils import is_local_adapter_busy_error
+        err = self._err(503, "{'error': {'type': 'overloaded_error', 'message': 'adapter is busy'}}")
+        assert is_local_adapter_busy_error(base_url="http://127.0.0.1:8082", error=err)
+        assert is_local_adapter_busy_error(base_url="http://localhost:8082/v1", error=err)
+
+    def test_remote_or_other_errors_are_not(self):
+        from agent.retry_utils import is_local_adapter_busy_error
+        busy = self._err(503, "adapter is busy")
+        assert not is_local_adapter_busy_error(base_url="https://api.anthropic.com", error=busy)
+        assert not is_local_adapter_busy_error(
+            base_url="http://127.0.0.1:8082", error=self._err(503, "upstream down"))
+        assert not is_local_adapter_busy_error(
+            base_url="http://127.0.0.1:8082", error=self._err(401, "adapter is busy"))

@@ -159,6 +159,24 @@ def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, err
     )
 
 
+# A local proxy that serialises work (the petasos Claude subscription adapter
+# runs three inferences at a time) answers 503 "adapter is busy" while its slots
+# are full. That is a queue, not an outage: waiting frees a slot within seconds
+# to minutes, while falling back sends the turn to a provider that may not
+# work at all. These retries cover roughly three minutes of jittered backoff.
+LOCAL_ADAPTER_BUSY_RETRIES = 8
+_LOOPBACK_HOSTS = ("://127.0.0.1", "://localhost", "://[::1]")
+
+
+def is_local_adapter_busy_error(*, base_url: str | None, error: Any) -> bool:
+    """Return True for a loopback proxy reporting that all its slots are taken."""
+    base = (base_url or "").lower()
+    if not any(host in base for host in _LOOPBACK_HOSTS):
+        return False
+    status = getattr(error, "status_code", None)
+    return status in (503, 529) and "adapter is busy" in _error_text(error)
+
+
 def adaptive_rate_limit_backoff(
     attempt: int,
     *,

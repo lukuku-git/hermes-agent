@@ -75,7 +75,9 @@ from agent.prompt_caching import (
     strip_anthropic_tool_cache_control,
 )
 from agent.retry_utils import (
+    LOCAL_ADAPTER_BUSY_RETRIES,
     adaptive_rate_limit_backoff,
+    is_local_adapter_busy_error,
     is_zai_coding_overload_error,
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
@@ -4463,9 +4465,20 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # A busy local adapter is a queue: wait for a slot on the same
+                # provider instead of falling back (see LOCAL_ADAPTER_BUSY_RETRIES).
+                _is_local_adapter_busy = is_local_adapter_busy_error(
+                    base_url=str(_base), error=api_error
+                )
+                if _is_local_adapter_busy:
+                    max_retries = max(max_retries, LOCAL_ADAPTER_BUSY_RETRIES)
                 _should_fallback = (
                     is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    or (
+                        _is_transport_failure
+                        and retry_count >= 2
+                        and not _is_local_adapter_busy
+                    )
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
