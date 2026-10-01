@@ -7830,8 +7830,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _operator_interrupt_watcher(self, interval: float = 2.0) -> None:
         """Background task: honour ``.interrupt_request.json`` (gateway/interrupt_control.py)."""
-        from gateway.interrupt_control import finish, read_request
+        from gateway.interrupt_control import _path, finish, read_request, REQUEST_NAME
 
+        logger.info("Operator-interrupt watcher started (marker %s)", _path(REQUEST_NAME))
         while self._running:
             try:
                 request = read_request()
@@ -7843,7 +7844,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("Operator-interrupt watcher tick error: %s", exc, exc_info=True)
+                logger.warning("Operator-interrupt watcher tick error: %s", exc, exc_info=True)
             await asyncio.sleep(interval)
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
@@ -11245,14 +11246,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
         
-        # Build initial channel directory for send_message name resolution
-        try:
-            from gateway.channel_directory import build_channel_directory
-            directory = await build_channel_directory(self.adapters)
-            ch_count = sum(len(chs) for chs in directory.get("platforms", {}).values())
-            logger.info("Channel directory built: %d target(s)", ch_count)
-        except Exception as e:
-            logger.warning("Channel directory build failed: %s", e)
+        # Build the channel directory in the background. It only feeds
+        # send_message name resolution and the previous build stays on disk
+        # meanwhile. Awaiting it here held startup for 6-8 minutes (Slack
+        # users.conversations plus a rate-limited conversations.info per
+        # configured channel) and every inbound message queued behind it, along
+        # with the drain and operator-interrupt watchers spawned below
+        # (2026-10-01).
+        async def _build_channel_directory_in_background() -> None:
+            try:
+                from gateway.channel_directory import build_channel_directory
+                directory = await build_channel_directory(self.adapters)
+                ch_count = sum(len(chs) for chs in directory.get("platforms", {}).values())
+                logger.info("Channel directory built: %d target(s)", ch_count)
+            except Exception as e:
+                logger.warning("Channel directory build failed: %s", e)
+
+        self._spawn_supervised(
+            _build_channel_directory_in_background, "channel_directory_build", restart=False
+        )
         
         # Check if we're restarting after a /update command. If the update is
         # still running, keep watching so we notify once it actually finishes.

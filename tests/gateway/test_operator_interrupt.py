@@ -53,3 +53,10 @@ def test_runner_interrupts_only_matching_turns():
     assert hit == ["agent:main:slack:group:T1:C0ALERT:1"]
     assert alert.stopped and "burst" in alert.stopped
     assert other.stopped is None and late.stopped is None
+
+
+def test_startup_does_not_wait_for_the_channel_directory():
+    from pathlib import Path
+    source = Path(__file__).resolve().parents[2].joinpath("gateway", "run.py").read_text(encoding="utf-8")
+    assert "directory = await build_channel_directory(self.adapters)\n            ch_count" not in source.split("_build_channel_directory_in_background")[0]
+    assert "_spawn_supervised(\n            _build_channel_directory_in_background" in source
