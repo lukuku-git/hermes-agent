@@ -8811,6 +8811,12 @@ class SlackAdapter(BasePlatformAdapter):
                         team_id, channel_id, result.dispatched, result.skipped,
                     )
 
+    # A replayed turn normally completes in seconds. On 2026-10-02 the fixed
+    # replay sat for over ten minutes on a completion that never came while no
+    # agent was running, and every later event waited behind it. Past this
+    # bound the event stays pending (retried later) and the slot moves on.
+    OBSERVER_REPLAY_STALL_SECONDS: ClassVar[float] = 900.0
+
     async def _dispatch_observer_bootstrap_message(self, event: dict) -> None:
         """Replay serially, retaining the claim/slot through turn completion.
 
@@ -8838,7 +8844,22 @@ class SlackAdapter(BasePlatformAdapter):
             cancelled = False
             while True:
                 try:
-                    await asyncio.shield(worker)
+                    done, _ = await asyncio.wait(
+                        {worker}, timeout=self.OBSERVER_REPLAY_STALL_SECONDS
+                    )
+                    if not done:
+                        logger.warning(
+                            "[Slack] Observer replay of %s:%s did not complete in %.0fs; "
+                            "leaving it pending and moving on",
+                            channel_id, event.get("ts"), self.OBSERVER_REPLAY_STALL_SECONDS,
+                        )
+                        stalled = getattr(self, "_observer_stalled_dispatches", None)
+                        if stalled is None:
+                            stalled = self._observer_stalled_dispatches = set()
+                        stalled.add(worker)
+                        worker.add_done_callback(stalled.discard)
+                        raise observer_catchup.ReplayNotCompleted("dispatch_stalled")
+                    worker.result()
                     break
                 except asyncio.CancelledError:
                     if worker.done():

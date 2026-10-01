@@ -209,6 +209,31 @@ async def test_catchup_waits_for_turn_before_claim_and_checkpoint(catchup_adapte
 
 
 @pytest.mark.asyncio
+async def test_stalled_replay_releases_the_slot(catchup_adapter, monkeypatch):
+    a = catchup_adapter
+    monkeypatch.setattr(type(a), "OBSERVER_REPLAY_STALL_SECONDS", 0.2)
+    never = asyncio.Event()
+    seen = []
+
+    async def agent(event):
+        seen.append(event.message_id)
+        if event.message_id == "101":
+            await never.wait()
+        await _successful_silent_agent(event)
+
+    a._message_handler = agent
+    try:
+        with pytest.raises(observer_catchup.ReplayNotCompleted, match="dispatch_stalled"):
+            await asyncio.wait_for(a._dispatch_observer_bootstrap_message(_history_event("101")), 3)
+        await asyncio.wait_for(a._dispatch_observer_bootstrap_message(_history_event("102")), 3)
+        assert seen == ["101", "102"]
+    finally:
+        never.set()
+        await _settle()
+        await a.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
 async def test_catchup_serializes_concurrent_dispatch_but_not_live(catchup_adapter):
     a = catchup_adapter
     started = asyncio.Queue()
