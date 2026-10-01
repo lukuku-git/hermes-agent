@@ -7807,6 +7807,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         self._update_runtime_status("running")
 
+    def _apply_operator_interrupt(self, request: dict) -> list[str]:
+        """Interrupt running turns that match an operator request; return their keys."""
+        from gateway.interrupt_control import matches
+
+        chats = list(request.get("chat_ids") or [])
+        started_after = request.get("started_after")
+        reason = f"operator interrupt: {request.get('reason') or 'requested'}"
+        hit: list[str] = []
+        for session_key, agent in list(self._running_agents.items()):
+            if agent is _AGENT_PENDING_SENTINEL:
+                continue
+            started_at = self._running_agents_ts.get(session_key)
+            if not matches(session_key, chats, started_at, started_after):
+                continue
+            try:
+                request_hard_interrupt(agent, reason)
+                hit.append(session_key)
+            except Exception:
+                logger.debug("Operator interrupt failed for %s", session_key, exc_info=True)
+        return hit
+
+    async def _operator_interrupt_watcher(self, interval: float = 2.0) -> None:
+        """Background task: honour ``.interrupt_request.json`` (gateway/interrupt_control.py)."""
+        from gateway.interrupt_control import finish, read_request
+
+        while self._running:
+            try:
+                request = read_request()
+                if request is not None:
+                    hit = self._apply_operator_interrupt(request)
+                    logger.warning("Operator interrupt %s stopped %d turn(s)",
+                                   request.get("request_id"), len(hit))
+                    finish(str(request["request_id"]), hit)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Operator-interrupt watcher tick error: %s", exc, exc_info=True)
+            await asyncio.sleep(interval)
+
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Background task: reconcile gateway accept-state with the drain marker.
 
@@ -11382,6 +11421,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is ignored via its instantiation epoch; only a current-epoch marker
         # engages drain on the first tick.
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
+        self._spawn_supervised(self._operator_interrupt_watcher, "operator_interrupt_watcher")
 
         logger.info("Press Ctrl+C to stop")
         
