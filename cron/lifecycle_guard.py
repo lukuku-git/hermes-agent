@@ -47,6 +47,15 @@ class GatewayLifecycleBlocked(ValueError):
     """Raised when a cron job spec contains a gateway-lifecycle command."""
 
 
+_BLOCKED_MESSAGE = (
+    "Blocked: cron job contains a gateway lifecycle command or persistent "
+    "launchctl submit operation. This is blocked to prevent agent-driven "
+    "SIGTERM-respawn loops under launchd/systemd supervision "
+    "(#30719). Run `hermes gateway restart` from a shell outside "
+    "the running gateway instead."
+)
+
+
 # Shell-level command shapes that target the gateway lifecycle. Each branch
 # is anchored on a concrete command identifier so a match can only fire on
 # actual shell-command-shaped strings, not on prose.
@@ -256,6 +265,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     try:
         metadata = os.fstat(descriptor)
+        # A directory cannot be executed, so it is not a hidden script. Other
+        # non-regular files (FIFOs, devices) still fail closed.
+        if stat.S_ISDIR(metadata.st_mode):
+            return None, False
         if not stat.S_ISREG(metadata.st_mode):
             return None, True
         if metadata.st_size > _MAX_REFERENCED_SCRIPT_BYTES:
@@ -375,6 +388,25 @@ def _read_script_for_scanning(script_path: str) -> str:
     return script_text or ""
 
 
+# The scheduler runs `.sh`/`.bash` scripts through bash and everything else
+# through Python (cron/scheduler.py). A Python script is not shell, so
+# tokenizing it as shell turns string literals such as `"~/"` into "referenced
+# scripts" and blocks harmless jobs. Python scripts get text checks instead:
+# the lifecycle regex plus launchctl submit/bootstrap in any quoting or
+# argv-list form, which is how Python would spell it.
+_SHELL_SCRIPT_SUFFIXES = frozenset({".sh", ".bash"})
+_PYTHON_LAUNCHCTL_SUBMIT = re.compile(
+    r"(?i)\blaunchctl\b[\"\x27\s,\]]{1,12}(?:submit|bootstrap)\b"
+)
+
+
+def _python_script_is_unsafe(script_text: str) -> bool:
+    normalized = _SHELL_LINE_CONTINUATION.sub(" ", script_text)
+    return contains_gateway_lifecycle_command(normalized) or bool(
+        _PYTHON_LAUNCHCTL_SUBMIT.search(normalized)
+    )
+
+
 def check_gateway_lifecycle(
     prompt: Optional[str],
     script: Optional[str] = None,
@@ -392,6 +424,11 @@ def check_gateway_lifecycle(
     surfaces this as a tool error; the CLI prints it in red and exits 1).
     """
     combined = prompt or ""
+    if script and _resolve_script_path(script).suffix.lower() not in _SHELL_SCRIPT_SUFFIXES:
+        script_text = _read_script_for_scanning(script)
+        if script_text and _python_script_is_unsafe(script_text):
+            raise GatewayLifecycleBlocked(_BLOCKED_MESSAGE)
+        script = None
     if script:
         script_text = _read_script_for_scanning(script)
         if script_text:
@@ -402,10 +439,4 @@ def check_gateway_lifecycle(
         combined,
         cwd=script_dir,
     ):
-        raise GatewayLifecycleBlocked(
-            "Blocked: cron job contains a gateway lifecycle command or persistent "
-            "launchctl submit operation. This is blocked to prevent agent-driven "
-            "SIGTERM-respawn loops under launchd/systemd supervision "
-            "(#30719). Run `hermes gateway restart` from a shell outside "
-            "the running gateway instead."
-        )
+        raise GatewayLifecycleBlocked(_BLOCKED_MESSAGE)
