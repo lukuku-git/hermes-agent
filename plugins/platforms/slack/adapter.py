@@ -64,12 +64,36 @@ try:  # sibling module; support both package and flat plugin-dir import
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
 
+try:  # sibling module; support both package and flat plugin-dir import
+    from . import observer_catchup
+except ImportError:  # pragma: no cover - plugin loaded outside package context
+    import observer_catchup  # type: ignore
+
 
 logger = logging.getLogger(__name__)
+
+# Only history replay waits for Base's background owner/drain chain. Live
+# ingress must still return immediately to support interruption and controls.
+_observer_catchup_dispatch = contextvars.ContextVar(
+    "slack_observer_catchup_dispatch", default=None
+)
 
 # #error-alert 는 헤임달 카드만 받는다 — 사람이 정한 것이지 추론이 아니다.
 _ERROR_ALERT_CHANNEL_ID = "C0C0PT7Q6RJ"
 _ERROR_ALERT_HEIMDALL_APP_ID = "A0C0PS76UGL"
+_ERROR_ALERT_HEIMDALL_BOT_ID = "B0C0FPVJR3P"
+
+
+def _is_heimdall_bot_event(event: dict) -> bool:
+    """Identify Heimdall even when Slack omits ``app_id`` for incoming webhooks."""
+    profile = event.get("bot_profile") or {}
+    app_id = str(
+        event.get("app_id")
+        or (profile.get("app_id") if isinstance(profile, dict) else "")
+        or ""
+    )
+    bot_id = str(event.get("bot_id") or "")
+    return app_id == _ERROR_ALERT_HEIMDALL_APP_ID or bot_id == _ERROR_ALERT_HEIMDALL_BOT_ID
 
 # User-Agent prefix for outbound Slack API calls so platform partners can
 # identify HermesAgent traffic — matching other Hermes outbound surfaces
@@ -390,6 +414,27 @@ def _rewrite_known_bang_command(text: str) -> str:
     except Exception:  # pragma: no cover - defensive
         pass
     return text
+
+
+def _rewrite_natural_offon_command(
+    text: str, enabled: Any, *, has_media: bool
+) -> str:
+    """Route a media-free natural Offon intent through its deterministic command."""
+    if enabled is not True or has_media:
+        return text
+    try:
+        from hermes_plugins.offon import slash as offon_slash
+        target = offon_slash.classify_natural_command(text)
+    except Exception as exc:
+        logger.warning("[Slack] natural Offon command classifier unavailable: %s", exc)
+        return text
+    if not isinstance(target, str) or not target.startswith("/"):
+        return text
+    logger.info(
+        "[Slack] semantic route mode=fast_head intent=personal_todo command=%s",
+        target,
+    )
+    return target
 
 
 def _extract_text_from_slack_blocks(blocks: list) -> str:
@@ -2261,6 +2306,30 @@ class SlackAdapter(BasePlatformAdapter):
                     "GATEWAY_ALLOW_ALL_USERS=true. Without these, bot events are "
                     "silently dropped upstream of the allow_bots gate.",
                     _allow_bots_cfg,
+                )
+
+            # Observer downtime catch-up (vendor patch, owned by
+            # scripts/install.py). A no-op for every profile except the one
+            # that scoped history_catchup_enabled=true — see
+            # _slack_history_catchup_enabled. Runs on both a fresh connect
+            # and a reconnect, since both paths call connect().
+            #
+            # It runs in the background. A full-history bootstrap of newly
+            # joined channels takes minutes; awaiting it here held connect()
+            # past the gateway's 180s connect timeout, so the observer never
+            # came up and the socket watchdog kept restarting (2026-10-01).
+            async def _observer_catchup_in_background() -> None:
+                try:
+                    await self._run_observer_history_catchup()
+                except Exception:
+                    logger.exception(
+                        "[Slack] Observer downtime catch-up failed; live delivery is unaffected"
+                    )
+
+            _previous_catchup = getattr(self, "_observer_catchup_task", None)
+            if _previous_catchup is None or _previous_catchup.done():
+                self._observer_catchup_task = asyncio.create_task(
+                    _observer_catchup_in_background()
                 )
 
             return True
@@ -5279,7 +5348,7 @@ class SlackAdapter(BasePlatformAdapter):
                     return True
         return False
 
-    async def _handle_slack_message(
+    async def _handle_slack_message_impl(
         self, event: dict, payload: Optional[dict] = None
     ) -> None:
         """Handle an incoming Slack message event."""
@@ -5297,10 +5366,10 @@ class SlackAdapter(BasePlatformAdapter):
             )
             _bot = str(event.get("bot_id") or "")
             if _bot or _app or _sub == "bot_message":
-                if _app != _ERROR_ALERT_HEIMDALL_APP_ID:
+                if not _is_heimdall_bot_event(event):
                     logger.info(
-                        "[Slack] Dropping message channel=%s reason=non_heimdall_bot app_id=%s",
-                        event.get("channel"), _app or "-",
+                        "[Slack] Dropping message channel=%s reason=non_heimdall_bot app_id=%s bot_id=%s",
+                        event.get("channel"), _app or "-", _bot or "-",
                     )
                     return
             elif _sub and _sub != "message_changed":
@@ -5835,6 +5904,21 @@ class SlackAdapter(BasePlatformAdapter):
                 and not self._slack_thread_require_mention()
             ):
                 self._register_mentioned_thread(thread_ts, team_id=team_id)
+
+        # Natural Offon intents enter the same deterministic lane as an authored
+        # slash command. This follows own-mention stripping and precedes
+        # MessageEvent construction, so active agent sessions cannot consume it.
+        if not is_command_text:
+            routed_text = _rewrite_natural_offon_command(
+                text,
+                self.config.extra.get("natural_command_routing"),
+                has_media=bool(event.get("files")),
+            )
+            if routed_text != text:
+                original_text = routed_text
+                text = routed_text
+                command_probe_text = routed_text
+                is_command_text = True
 
         # Thread context rules:
         # - First message in a thread session (cold start): hydrate full
@@ -6422,6 +6506,33 @@ class SlackAdapter(BasePlatformAdapter):
                 self._processed_message_ts = dict(newest_items)
 
         await self.handle_message(msg_event)
+        if _observer_catchup_dispatch.get() is msg_event.raw_message:
+            from gateway.session import build_session_key
+
+            session_key = build_session_key(
+                msg_event.source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            )
+            # Base returns after installing/queuing an owner. That owner may
+            # hand off to a fresh drain task in either its body or finally.
+            # Waiting for only the first task would release the replay slot
+            # (and the wrapper's claim) while the drain is still running.
+            failure = None
+            owner = self._session_tasks.get(session_key)
+            while owner is not None:
+                try:
+                    await asyncio.shield(owner)
+                except BaseException as exc:
+                    failure = exc
+                next_owner = self._session_tasks.get(session_key)
+                if next_owner is owner:
+                    break
+                owner = next_owner
+            if failure is not None:
+                raise failure
+
+    _handle_slack_message = observer_catchup.claim_gated_message(_handle_slack_message_impl)
 
     # ----- Approval button support (Block Kit) -----
 
@@ -8427,6 +8538,12 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _slack_free_response_channels(self) -> set:
         """Return channel IDs where no @mention is required."""
+        if self.config.extra.get("offon_dynamic_channels") is True:
+            try:
+                from hermes_plugins.offon import channels as offon_channels
+            except ImportError:
+                from plugins.offon import channels as offon_channels
+            return set(offon_channels.dynamic_channel_csv().split(",")) - {""}
         raw = self.config.extra.get("free_response_channels")
         if raw is None:
             raw = os.getenv("SLACK_FREE_RESPONSE_CHANNELS", "")
@@ -8465,6 +8582,12 @@ class SlackAdapter(BasePlatformAdapter):
         by ``_slack_disable_dms()``. Empty set means no channel restriction
         (fully backward compatible).
         """
+        if self.config.extra.get("offon_dynamic_channels") is True:
+            try:
+                from hermes_plugins.offon import channels as offon_channels
+            except ImportError:
+                from plugins.offon import channels as offon_channels
+            return set(offon_channels.dynamic_channel_csv().split(",")) - {""}
         raw = self.config.extra.get("allowed_channels")
         if raw is None:
             raw = os.getenv("SLACK_ALLOWED_CHANNELS", "")
@@ -8473,6 +8596,202 @@ class SlackAdapter(BasePlatformAdapter):
         if isinstance(raw, str) and raw.strip():
             return {part.strip() for part in raw.split(",") if part.strip()}
         return set()
+
+    def _slack_history_catchup_enabled(self) -> bool:
+        """Downtime catch-up: read approved channel history on connect.
+
+        Off by default and only ever turned on by a profile's own scoped
+        config (e.g. profiles/observer/config.yaml) — a persistent profile
+        picking up history it never asked for would silently start
+        replying to a backlog of unrelated messages.
+        """
+        raw = self.config.extra.get("history_catchup_enabled")
+        if raw is None:
+            raw = os.getenv("SLACK_HISTORY_CATCHUP_ENABLED", "false")
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"true", "1", "yes", "on"}
+        return bool(raw)
+
+    def _slack_history_catchup_channels(self) -> set:
+        """Membership candidates allowed to bootstrap without becoming live."""
+        raw = self.config.extra.get("history_catchup_channels")
+        if raw is None:
+            raw = os.getenv("SLACK_HISTORY_CATCHUP_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        if isinstance(raw, str) and raw.strip():
+            return {part.strip() for part in raw.split(",") if part.strip()}
+        return set()
+
+    def _slack_history_catchup_lookback_seconds(self) -> float:
+        raw = self.config.extra.get("history_catchup_lookback_seconds")
+        if raw is None:
+            raw = os.getenv("SLACK_HISTORY_CATCHUP_LOOKBACK_SECONDS")
+        try:
+            return float(raw) if raw is not None else float(observer_catchup.DEFAULT_LOOKBACK_SECONDS)
+        except (TypeError, ValueError):
+            return float(observer_catchup.DEFAULT_LOOKBACK_SECONDS)
+
+    def _slack_history_catchup_page_limit(self) -> int:
+        raw = self.config.extra.get("history_catchup_page_limit")
+        if raw is None:
+            raw = os.getenv("SLACK_HISTORY_CATCHUP_PAGE_LIMIT")
+        try:
+            return int(raw) if raw is not None else observer_catchup.DEFAULT_PAGE_LIMIT
+        except (TypeError, ValueError):
+            return observer_catchup.DEFAULT_PAGE_LIMIT
+
+    def _slack_history_catchup_page_size(self) -> int:
+        raw = self.config.extra.get("history_catchup_page_size")
+        if raw is None:
+            raw = os.getenv("SLACK_HISTORY_CATCHUP_PAGE_SIZE")
+        try:
+            return int(raw) if raw is not None else observer_catchup.DEFAULT_PAGE_SIZE
+        except (TypeError, ValueError):
+            return observer_catchup.DEFAULT_PAGE_SIZE
+
+    def _slack_history_catchup_message_limit(self) -> int:
+        raw = self.config.extra.get("history_catchup_message_limit")
+        if raw is None:
+            raw = os.getenv("SLACK_HISTORY_CATCHUP_MESSAGE_LIMIT")
+        try:
+            return int(raw) if raw is not None else observer_catchup.DEFAULT_MESSAGE_LIMIT
+        except (TypeError, ValueError):
+            return observer_catchup.DEFAULT_MESSAGE_LIMIT
+
+    def _observer_catchup_store(self):
+        """Open (and cache) the persistent downtime catch-up database.
+
+        Lives at this profile's own ``get_hermes_home() /
+        observer_catchup.sqlite3`` — a standalone Observer process's own
+        ``$HERMES_HOME`` already *is* its profile directory, so nesting
+        another ``profiles/observer/`` under it would double the path.
+        Mode 0600, parent 0700 (see ``observer_catchup.open_store``) — a
+        durable claim/checkpoint ledger, scoped as tightly as the
+        credential files it sits next to, and only ever opened by a
+        process whose own config has ``history_catchup_enabled: true``.
+        """
+        store = getattr(self, "_observer_catchup_conn", None)
+        if store is not None:
+            return store
+        from hermes_constants import get_hermes_home
+
+        db_path = get_hermes_home() / "observer_catchup.sqlite3"
+        store = observer_catchup.open_store(db_path)
+        self._observer_catchup_conn = store
+        return store
+
+    async def _run_observer_history_catchup(self) -> None:
+        """Bootstrap new member channels, then catch up after reconnect.
+
+        A new channel starts at inception and durably resumes bounded pages
+        until history and every reply cursor are empty. Completed channels use
+        the ordinary checkpoint/lookback path for later downtime gaps.
+        """
+        if not self._slack_history_catchup_enabled():
+            return
+        configured = self._slack_history_catchup_channels()
+        # bootstrap candidates are intentionally independent from the
+        # completed-only live predicate. Membership discovery grants history
+        # replay scope, never live/free-response scope.
+        source_channels = frozenset(configured)
+        if not source_channels:
+            return
+        config = observer_catchup.CatchupConfig(
+            enabled=True,
+            source_channels=source_channels,
+            lookback_seconds=self._slack_history_catchup_lookback_seconds(),
+            page_limit=self._slack_history_catchup_page_limit(),
+            page_size=self._slack_history_catchup_page_size(),
+            message_limit=self._slack_history_catchup_message_limit(),
+        )
+        store = self._observer_catchup_store()
+        for team_id, client in list(self._team_clients.items()):
+            try:
+                results = await observer_catchup.run_catchup(
+                    client=client,
+                    dispatch=self._dispatch_observer_bootstrap_message,
+                    conn=store,
+                    workspace_id=team_id,
+                    allowed_channels=source_channels,
+                    config=config,
+                    bot_user_id=self._team_bot_user_ids.get(team_id, ""),
+                    now=time.time(),
+                )
+                while any(result.pending for result in results.values()) and (
+                    not any(result.error for result in results.values())
+                    and any(result.progressed for result in results.values())
+                ):
+                    results = await observer_catchup.run_catchup(
+                        client=client,
+                        dispatch=self._dispatch_observer_bootstrap_message,
+                        conn=store,
+                        workspace_id=team_id,
+                        allowed_channels=source_channels,
+                        config=config,
+                        bot_user_id=self._team_bot_user_ids.get(team_id, ""),
+                        now=time.time(),
+                    )
+            except Exception:
+                logger.exception(
+                    "[Slack] Observer catch-up failed for workspace %s; live delivery is unaffected",
+                    team_id,
+                )
+                continue
+            for channel_id, result in results.items():
+                if result.error:
+                    logger.warning(
+                        "[Slack] Observer catch-up for %s/%s stopped early: %s "
+                        "(dispatched=%d skipped=%d) — resumes from the last "
+                        "successful checkpoint next connect",
+                        team_id, channel_id, result.error,
+                        result.dispatched, result.skipped,
+                    )
+                elif result.dispatched or result.skipped:
+                    logger.info(
+                        "[Slack] Observer catch-up for %s/%s: dispatched=%d skipped=%d",
+                        team_id, channel_id, result.dispatched, result.skipped,
+                    )
+
+    async def _dispatch_observer_bootstrap_message(self, event: dict) -> None:
+        """Replay serially, retaining the claim/slot through turn completion.
+
+        Cancelling the caller does not cancel a running turn: finish its
+        dispatch before propagating cancellation so reconnect cannot retry a
+        released pending claim while the original turn is still alive.
+        """
+        try:
+            from hermes_plugins.offon import channels as offon_channels
+        except ImportError:
+            from plugins.offon import channels as offon_channels
+        channel_id = str(event.get("channel") or "")
+        lock = getattr(self, "_observer_catchup_dispatch_lock", None)
+        if lock is None:
+            lock = self._observer_catchup_dispatch_lock = asyncio.Lock()
+        async with lock:
+            async def dispatch() -> None:
+                token = _observer_catchup_dispatch.set(event)
+                try:
+                    with offon_channels.bootstrap_dispatch_scope(channel_id):
+                        await self._handle_slack_message(event, None)
+                finally:
+                    _observer_catchup_dispatch.reset(token)
+
+            worker = asyncio.create_task(dispatch())
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(worker)
+                    break
+                except asyncio.CancelledError:
+                    if worker.done():
+                        # Retrieve the terminal outcome, including owner
+                        # cancellation, without leaving an unobserved task.
+                        worker.result()
+                        raise
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
 
     def _slack_require_mention_channels(self) -> set:
         """Return channel IDs where a bot @mention is ALWAYS required.
@@ -9090,11 +9409,6 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         os.environ["SLACK_REQUIRE_MENTION_CHANNELS"] = str(rmc)
     if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
         os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
-    rt = slack_cfg.get("reaction_triggers")
-    if rt is not None and not os.getenv("SLACK_REACTION_TRIGGERS"):
-        if isinstance(rt, (list, tuple, set)):
-            rt = ",".join(str(v) for v in rt)
-        os.environ["SLACK_REACTION_TRIGGERS"] = str(rt)
     rtt = slack_cfg.get("reaction_trigger_target")
     if rtt is not None and not os.getenv("SLACK_REACTION_TRIGGER_TARGET"):
         os.environ["SLACK_REACTION_TRIGGER_TARGET"] = str(rtt)
@@ -9128,10 +9442,33 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
             "require_mention_channels",
             "allow_bots",
             "allowed_channels",
+            "history_catchup_enabled",
+            "history_catchup_channels",
+            "history_catchup_lookback_seconds",
+            "history_catchup_page_limit",
+            "history_catchup_page_size",
+            "history_catchup_message_limit",
+            "reaction_triggers",
+            "natural_command_routing",
         )
         if key in slack_cfg
     }
-    for _list_key in ("free_response_channels", "require_mention_channels"):
+    if slack_cfg.get("offon_dynamic_channels") is True:
+        # Projection sync is owned by the external user LaunchAgent, never by
+        # this multiplexed gateway.  The adapter only reads its durable output.
+        try:
+            from hermes_plugins.offon import channels as offon_channels
+        except ImportError:  # tests/source-tree execution
+            from plugins.offon import channels as offon_channels
+        dynamic = offon_channels.dynamic_channel_csv()
+        bootstrap_candidates = offon_channels.bootstrap_candidate_channel_csv()
+        scoped["offon_dynamic_channels"] = True
+        scoped["allowed_channels"] = dynamic
+        scoped["free_response_channels"] = dynamic
+        scoped["history_catchup_channels"] = bootstrap_candidates
+    for _list_key in (
+        "free_response_channels", "require_mention_channels", "history_catchup_channels"
+    ):
         if isinstance(scoped.get(_list_key), list):
             scoped[_list_key] = ",".join(str(v) for v in scoped[_list_key])
     return scoped or None
