@@ -168,6 +168,48 @@ class TestFallbackCredentialIsolation:
         assert agent._transport_cache == {}
 
 
+class TestFallbackExplicitApiMode:
+    """A local Anthropic-compatible proxy names its wire format in the entry."""
+
+    def test_entry_api_mode_wins_over_url_guess(self):
+        from agent.chat_completion_helpers import try_activate_fallback
+
+        agent = _make_agent()
+        agent._fallback_chain = [{
+            "provider": "custom",
+            "model": "claude-sonnet-5",
+            "base_url": "http://127.0.0.1:8082",
+            "api_mode": "anthropic_messages",
+            "key_env": "ADAPTER_KEY",
+        }]
+        agent._credential_pool = _make_pool("openai-codex")
+        agent._buffer_status = MagicMock()
+        agent._is_azure_openai_url.return_value = False
+        agent._is_direct_openai_url.return_value = False
+        agent._provider_model_requires_responses_api.return_value = False
+        agent._anthropic_prompt_cache_policy.return_value = (False, False)
+        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent._replace_primary_openai_client = MagicMock()
+        agent.context_compressor = None
+
+        fallback_client = SimpleNamespace(
+            api_key="adapter-key", base_url="http://127.0.0.1:8082", _custom_headers={},
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "claude-sonnet-5"),
+        ), patch(
+            "agent.credential_pool.load_pool", return_value=None,
+        ), patch(
+            "agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock(),
+        ) as build:
+            assert try_activate_fallback(agent) is True
+
+        assert agent.api_mode == "anthropic_messages"
+        build.assert_called_once()
+        assert build.call_args.args[:2] == ("adapter-key", "http://127.0.0.1:8082")
+
+
 # ── Test: _recover_with_credential_pool rejects mismatched pool ──────
 
 class TestRecoveryProviderGuard:
