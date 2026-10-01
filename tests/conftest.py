@@ -987,13 +987,24 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         config.option.timeout_method = "thread"
 
 
+_PETASOS_UNDEPLOYED_PLATFORMS = ("discord",)
+
+
 def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
     """Skip ``requires_wal`` tests when the linked SQLite can't use WAL.
 
     Cheaper and more honest than each test hand-rolling a version check: the
     reason string names the actual linked version so the skip is diagnosable
     rather than mysterious.
+
+    On petasos it also skips platforms that are not deployed: the gateway
+    runs Slack and Telegram only, so Discord tests prove nothing here.
     """
+    undeployed = pytest.mark.skip(reason="petasos: platform not deployed (Slack and Telegram only)")
+    for item in items:
+        if any(name in item.nodeid.lower() for name in _PETASOS_UNDEPLOYED_PLATFORMS):
+            item.add_marker(undeployed)
+
     if _wal_is_usable():
         return
 
