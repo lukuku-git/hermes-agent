@@ -66,6 +66,22 @@ class TestStateMachine:
         assert _row("ob-1")["state"] == "pending"
 
 
+class TestPermanentRejection:
+    def test_not_in_channel_is_abandoned_and_never_swept(self):
+        _record()
+        dl.mark_failed("ob-1", "The server responded with: {'ok': False, 'error': 'not_in_channel'}")
+        assert _row("ob-1")["state"] == "abandoned"
+        _orphan("ob-1")
+        assert dl.sweep_recoverable() == []
+
+    def test_transient_failure_stays_retryable(self):
+        _record()
+        dl.mark_failed("ob-1", "Read timed out")
+        assert _row("ob-1")["state"] == "failed"
+        _orphan("ob-1")
+        assert [r["obligation_id"] for r in dl.sweep_recoverable()] == ["ob-1"]
+
+
 class TestObligationId:
     def test_stable_and_distinct(self):
         a = dl.compute_obligation_id("sk1", "msg1", "hello")

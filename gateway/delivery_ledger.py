@@ -61,6 +61,19 @@ _DB_LOCK = threading.Lock()
 MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+# Platform rejections no retry can fix: the bot is not in the channel, the
+# channel is gone, or the token lacks the scope. Retrying them spent every
+# restart re-sending ~100 stale notices to customer channels (2026-10-01).
+PERMANENT_SEND_ERRORS = (
+    "not_in_channel",
+    "channel_not_found",
+    "missing_scope",
+    "is_archived",
+    "account_inactive",
+    "invalid_auth",
+    "restricted_action",
+)
 _MAX_ROWS = 500
 
 # Visible prefix for redeliveries that might duplicate an already-received
@@ -219,8 +232,15 @@ def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
 
 
+def is_permanent_send_error(error: str) -> bool:
+    text = (error or "").lower()
+    return any(code in text for code in PERMANENT_SEND_ERRORS)
+
+
 def mark_failed(obligation_id: str, error: str = "") -> None:
-    _update_state(obligation_id, "failed", error=error)
+    """A permanent rejection is abandoned at once; anything else stays retryable."""
+    state = "abandoned" if is_permanent_send_error(error) else "failed"
+    _update_state(obligation_id, state, error=error)
 
 
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
