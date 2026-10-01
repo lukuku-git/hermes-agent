@@ -116,6 +116,18 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "Full details saved in cron output."
         )
 
+    # The inactivity guard raises TimeoutError too, but nothing about the
+    # provider failed: the job stopped making progress (2026-10-01, a terminal
+    # call blocked on a macOS TCC-protected folder). Say which, and where.
+    idle = re.search(r"idle for (\d+)s \(limit (\d+)s\)(?:\s*\W\s*last activity:\s*(.+))?", text)
+    if idle:
+        where = f" Last activity: {idle.group(3).strip()[:120]}." if idle.group(3) else ""
+        return (
+            f"⚠️ Cron {job_name} failed: no progress for {idle.group(1)}s "
+            f"(inactivity limit {idle.group(2)}s).{where} "
+            "Full details saved in cron output."
+        )
+
     if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
