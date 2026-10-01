@@ -17426,6 +17426,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=event.message_type,
             )
 
+            if event.execution_result_required:
+                event.record_execution_result(agent_result)
+
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
             # same routing metadata used by the response delivery path.

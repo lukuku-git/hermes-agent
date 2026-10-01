@@ -1683,6 +1683,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=str(e))
 
+    @observer_catchup.customer_output
     async def _post_ephemeral_fallback(
         self,
         chat_id: str,
@@ -2319,12 +2320,18 @@ class SlackAdapter(BasePlatformAdapter):
             # past the gateway's 180s connect timeout, so the observer never
             # came up and the socket watchdog kept restarting (2026-10-01).
             async def _observer_catchup_in_background() -> None:
-                try:
-                    await self._run_observer_history_catchup()
-                except Exception:
-                    logger.exception(
-                        "[Slack] Observer downtime catch-up failed; live delivery is unaffected"
-                    )
+                while self._running and self._slack_history_catchup_enabled():
+                    try:
+                        await self._run_observer_history_catchup()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "[Slack] Observer downtime catch-up failed; live delivery is unaffected"
+                        )
+                    # Bounded periodic attempts, including manifests activated
+                    # after connect. No LLM cron or new adapter/process owner.
+                    await asyncio.sleep(60)
 
             _previous_catchup = getattr(self, "_observer_catchup_task", None)
             if _previous_catchup is None or _previous_catchup.done():
@@ -2341,6 +2348,7 @@ class SlackAdapter(BasePlatformAdapter):
             if lock_acquired and not self._running:
                 self._release_platform_lock()
 
+    @observer_catchup.customer_output
     async def create_handoff_thread(
         self,
         parent_chat_id: str,
@@ -2559,6 +2567,7 @@ class SlackAdapter(BasePlatformAdapter):
         ignored = self._slack_ignored_channels()
         return "*" in ignored or parent_channel_id in ignored
 
+    @observer_catchup.customer_output
     async def send(
         self,
         chat_id: str,
@@ -2743,6 +2752,7 @@ class SlackAdapter(BasePlatformAdapter):
                 retry_after=_retry_after,
             )
 
+    @observer_catchup.customer_output
     async def send_private_notice(
         self,
         chat_id: str,
@@ -2787,6 +2797,7 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] Ephemeral send error: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    @observer_catchup.customer_output
     async def send_or_update_status(
         self,
         chat_id: str,
@@ -2830,6 +2841,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._status_message_ids[key] = str(result.message_id)
         return result
 
+    @observer_catchup.customer_output
     async def edit_message(
         self,
         chat_id: str,
@@ -2941,6 +2953,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=str(e))
 
+    @observer_catchup.customer_output
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a Slack message previously sent by this bot.
 
@@ -2969,6 +2982,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return False
 
+    @observer_catchup.customer_output
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show a typing/status indicator using assistant.threads.setStatus.
 
@@ -3066,6 +3080,7 @@ class SlackAdapter(BasePlatformAdapter):
             # in an assistant-enabled context. Falls back to reactions.
             logger.debug("[Slack] assistant.threads.setStatus failed: %s", e)
 
+    @observer_catchup.customer_output
     async def stop_typing(self, chat_id: str, metadata=None) -> None:
         """Clear the assistant thread status indicator."""
         if self._is_ignored_channel(chat_id):
@@ -3334,6 +3349,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         raise last_exc
 
+    @observer_catchup.customer_output
     async def send_multiple_images(
         self,
         chat_id: str,
@@ -3831,6 +3847,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- Reactions -----
 
+    @observer_catchup.customer_output
     async def _add_reaction(
         self, channel: str, timestamp: str, emoji: str, team_id: str = ""
     ) -> bool:
@@ -3847,6 +3864,7 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] reactions.add failed (%s): %s", emoji, e)
             return False
 
+    @observer_catchup.customer_output
     async def _remove_reaction(
         self, channel: str, timestamp: str, emoji: str, team_id: str = ""
     ) -> bool:
@@ -4125,6 +4143,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._user_is_bot_cache[cache_key] = False
             return False
 
+    @observer_catchup.customer_output
     async def send_image_file(
         self,
         chat_id: str,
@@ -4156,6 +4175,7 @@ class SlackAdapter(BasePlatformAdapter):
                 text = f"{caption}\n{text}"
             return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
+    @observer_catchup.customer_output
     async def send_image(
         self,
         chat_id: str,
@@ -4226,6 +4246,7 @@ class SlackAdapter(BasePlatformAdapter):
                 metadata=metadata,
             )
 
+    @observer_catchup.customer_output
     async def send_voice(
         self,
         chat_id: str,
@@ -4253,6 +4274,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=str(e))
 
+    @observer_catchup.customer_output
     async def send_video(
         self,
         chat_id: str,
@@ -4317,6 +4339,7 @@ class SlackAdapter(BasePlatformAdapter):
                 text = f"{caption}\n{text}"
             return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
+    @observer_catchup.customer_output
     async def send_document(
         self,
         chat_id: str,
@@ -6462,6 +6485,13 @@ class SlackAdapter(BasePlatformAdapter):
             },
         )
 
+        replay = _observer_catchup_dispatch.get() is event
+        msg_event.execution_result_required = replay
+        execution_run_id = observer_catchup.execution_run_id(channel_id, thread_ts or ts, ts, replay)
+        msg_event.execution_context = lambda: observer_catchup.event_execution_scope(
+            channel_id, thread_ts or ts, ts, replay, execution_run_id
+        )
+
         # Only react when bot is directly addressed (1:1 DM or @mention).
         # MPIMs are shared surfaces: reacting to every group-DM message (even
         # when unmentioned) is visible noise to the whole group, so they must
@@ -6530,12 +6560,29 @@ class SlackAdapter(BasePlatformAdapter):
                     break
                 owner = next_owner
             if failure is not None:
+                self._processed_message_ts.pop(ts, None)
                 raise failure
+            if msg_event.handler_outcome != ProcessingOutcome.SUCCESS:
+                self._processed_message_ts.pop(ts, None)
+                raise observer_catchup.ReplayNotCompleted(msg_event.execution_error or "replay_handler_not_successful")
+            if replay:
+                try:
+                    from hermes_plugins.offon import delivery
+                except ImportError:
+                    from plugins.offon import delivery
+                outcome = delivery.Store().event_outcome()
+                if outcome is None and msg_event.execution_intentional_silence:
+                    delivery.record_skip("intentional_skip")
+                    outcome = "intentional_skip"
+                if outcome not in {"success", "closed", "protected", "intentional_skip"}:
+                    self._processed_message_ts.pop(ts, None)
+                    raise observer_catchup.ReplayNotCompleted("business_outcome_unknown")
 
     _handle_slack_message = observer_catchup.claim_gated_message(_handle_slack_message_impl)
 
     # ----- Approval button support (Block Kit) -----
 
+    @observer_catchup.customer_output
     async def send_exec_approval(
         self,
         chat_id: str,
@@ -6642,6 +6689,7 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] send_exec_approval failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    @observer_catchup.customer_output
     async def send_slash_confirm(
         self,
         chat_id: str,
@@ -6723,6 +6771,7 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] send_slash_confirm failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    @observer_catchup.customer_output
     async def send_clarify(
         self,
         chat_id: str,
@@ -8706,38 +8755,47 @@ class SlackAdapter(BasePlatformAdapter):
             message_limit=self._slack_history_catchup_message_limit(),
         )
         store = self._observer_catchup_store()
-        for team_id, client in list(self._team_clients.items()):
+        try:
+            from hermes_plugins.offon import recovery
+        except ImportError:
             try:
-                results = await observer_catchup.run_catchup(
-                    client=client,
-                    dispatch=self._dispatch_observer_bootstrap_message,
-                    conn=store,
-                    workspace_id=team_id,
-                    allowed_channels=source_channels,
-                    config=config,
-                    bot_user_id=self._team_bot_user_ids.get(team_id, ""),
-                    now=time.time(),
-                )
-                while any(result.pending for result in results.values()) and (
-                    not any(result.error for result in results.values())
-                    and any(result.progressed for result in results.values())
-                ):
-                    results = await observer_catchup.run_catchup(
-                        client=client,
-                        dispatch=self._dispatch_observer_bootstrap_message,
-                        conn=store,
-                        workspace_id=team_id,
-                        allowed_channels=source_channels,
-                        config=config,
-                        bot_user_id=self._team_bot_user_ids.get(team_id, ""),
-                        now=time.time(),
-                    )
-            except Exception:
-                logger.exception(
-                    "[Slack] Observer catch-up failed for workspace %s; live delivery is unaffected",
-                    team_id,
-                )
-                continue
+                from plugins.offon import recovery
+            except ImportError:
+                recovery = None
+        operator = recovery.Operator() if recovery is not None else None
+        if operator is not None and operator.manifest_path.exists():
+            # Invalid activation is fail-closed for replay/bootstrap, never live.
+            manifest = operator.manifest()
+            if manifest["state"] == "planned":
+                return
+            await operator.round(self, observer_catchup)
+            # A fixed manifest exclusively owns historical replay, including
+            # continuing/done. Genuine live delivery uses its separate gate.
+            return
+
+        async def dispatch_with_recovery_priority(event):
+            # Slot boundary only: never cancel a running actual owner/drain.
+            if operator is not None and operator.manifest_path.exists():
+                await operator.round(self, observer_catchup, limit=1)
+                manifest = operator.manifest()
+                if manifest["state"] == "active":
+                    pending = store.execute("SELECT state FROM operator_recovery_events WHERE run=? AND channel=? AND message=?",
+                        (manifest["run"], event.get("channel"), event.get("ts"))).fetchone()
+                    if pending and pending[0] != "completed":
+                        raise observer_catchup.ReplayNotCompleted("fixed_recovery_pending")
+            await self._dispatch_observer_bootstrap_message(event)
+
+        try:
+            workspaces = await observer_catchup.run_workspace_catchups(
+                clients=dict(self._team_clients),
+                dispatch=dispatch_with_recovery_priority,
+                conn=store, config=config, bot_user_ids=self._team_bot_user_ids,
+                max_rounds=1,
+            )
+        except Exception:
+            logger.exception("[Slack] Observer catch-up store/runner failed; live delivery is unaffected")
+            return
+        for team_id, results in workspaces.items():
             for channel_id, result in results.items():
                 if result.error:
                     logger.warning(
@@ -8760,10 +8818,6 @@ class SlackAdapter(BasePlatformAdapter):
         dispatch before propagating cancellation so reconnect cannot retry a
         released pending claim while the original turn is still alive.
         """
-        try:
-            from hermes_plugins.offon import channels as offon_channels
-        except ImportError:
-            from plugins.offon import channels as offon_channels
         channel_id = str(event.get("channel") or "")
         lock = getattr(self, "_observer_catchup_dispatch_lock", None)
         if lock is None:
@@ -8772,7 +8826,10 @@ class SlackAdapter(BasePlatformAdapter):
             async def dispatch() -> None:
                 token = _observer_catchup_dispatch.set(event)
                 try:
-                    with offon_channels.bootstrap_dispatch_scope(channel_id):
+                    with observer_catchup.event_execution_scope(
+                        channel_id, str(event.get("thread_ts") or event.get("ts") or ""),
+                        str(event.get("ts") or ""), True
+                    ):
                         await self._handle_slack_message(event, None)
                 finally:
                     _observer_catchup_dispatch.reset(token)
@@ -8982,6 +9039,7 @@ async def _standalone_upload_file(
     return {"success": True, "message_id": message_id, "raw": result}
 
 
+@observer_catchup.customer_output
 async def _standalone_send(
     pconfig,
     chat_id,

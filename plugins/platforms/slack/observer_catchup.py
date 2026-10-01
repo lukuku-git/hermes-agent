@@ -15,8 +15,9 @@ its own — it only fetches, orders, and hands messages to the caller-supplied
 ``dispatch``, then advances a checkpoint once ``dispatch`` returns without
 raising. The Slack replay callback must wait for the actual background turn
 and its owner/drain chain, not merely Base's immediate handoff return. This
-is a completion boundary, not proof of agent success: Base may log and
-swallow a handler exception before the owner finishes.
+is a lifecycle completion boundary, not proof of business/notification success.
+The adapter must also inspect the event's trusted handler outcome because Base
+logs and swallows handler exceptions before the owner finishes.
 
 Claims are crash-safe: ``claim_message`` records a *pending* row, not a
 permanent one. A caller that finishes must call ``complete_claim`` (making
@@ -29,14 +30,84 @@ window of dedup, never availability.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import wraps
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+
+_CUSTOMER_OUTPUT_BLOCKED = ContextVar("observer_customer_output_blocked", default=False)
+
+
+@contextmanager
+def event_execution_scope(channel_id, root_ts, message_ts, replay, run_id=None):
+    """Rebind immutable adapter source at the actual owner, including drains."""
+    token = _CUSTOMER_OUTPUT_BLOCKED.set(replay)
+    try:
+        try:
+            from hermes_plugins.offon import channels, safety
+        except ImportError:
+            try:
+                from plugins.offon import channels, safety
+            except ImportError:
+                if replay:
+                    raise
+                yield
+                return
+        if run_id is None:
+            run_id = execution_run_id(channel_id, root_ts, message_ts, replay)
+        source = safety.Source(channel_id, root_ts, message_ts, recovery=replay, run_id=run_id)
+        with channels.bootstrap_dispatch_scope(channel_id if replay else ""):
+            with safety.execution_scope(source):
+                yield
+    finally:
+        _CUSTOMER_OUTPUT_BLOCKED.reset(token)
+
+
+def execution_run_id(channel_id, root_ts, message_ts, replay):
+    """Capture an existing trusted Source run, never message metadata."""
+    try:
+        from hermes_plugins.offon import safety
+    except ImportError:
+        try:
+            from plugins.offon import safety
+        except ImportError:
+            return ""
+    current = safety.source()
+    if current and replay and current.recovery and (
+        current.channel_id, current.root_ts, current.message_ts
+    ) == (channel_id, root_ts, message_ts):
+        return current.run_id
+    return ""
+
+
+def customer_output(method):
+    """Slack adapter boundary; internal Offon webhook is independent."""
+    @wraps(method)
+    async def wrapped(*args, **kwargs):
+        if _CUSTOMER_OUTPUT_BLOCKED.get():
+            error = "trusted_replay_customer_output_suppressed"
+            if method.__name__ == "_standalone_send":
+                return {"success": False, "error": error}
+            if method.__name__ in {"_add_reaction", "_remove_reaction", "delete_message"}:
+                return False
+            if method.__name__ in {"send_typing", "stop_typing", "create_handoff_thread"}:
+                return None
+            from gateway.platforms.base import SendResult
+            return SendResult(success=False, error=error)
+        return await method(*args, **kwargs)
+    return wrapped
+
+
+class ReplayNotCompleted(RuntimeError):
+    """Retryable handler failure/busy, never business success."""
 
 DEFAULT_LOOKBACK_SECONDS = 24 * 60 * 60
 DEFAULT_PAGE_LIMIT = 5
@@ -73,6 +144,8 @@ def claim_gated_message(method):
             store = self._observer_catchup_store()
             claimed = claim_message(store, workspace_id, channel_id, ts, time.time())
         except Exception:
+            if _CUSTOMER_OUTPUT_BLOCKED.get():
+                raise ReplayNotCompleted("replay_claim_store_failed")
             logging.getLogger(method.__module__).debug(
                 "[Slack] Observer catch-up claim failed; processing live", exc_info=True
             )
@@ -80,6 +153,13 @@ def claim_gated_message(method):
             return
 
         if not claimed:
+            if _CUSTOMER_OUTPUT_BLOCKED.get():
+                row = store.execute(
+                    "SELECT status FROM claimed_messages WHERE workspace_id=? AND channel_id=? AND ts=?",
+                    (workspace_id, channel_id, ts),
+                ).fetchone()
+                if not row or row[0] != "completed":
+                    raise ReplayNotCompleted("replay_claim_busy")
             return
 
         try:
@@ -130,6 +210,8 @@ class ChannelCatchupResult:
     error: Optional[str] = None
     pending: bool = False
     progressed: bool = False
+    first_error: Optional[str] = None
+    attempts: int = 0
 
 
 def open_store(path: Path) -> sqlite3.Connection:
@@ -231,6 +313,11 @@ def open_store(path: Path) -> sqlite3.Connection:
                 PRIMARY KEY (workspace_id, channel_id, kind, root_ts, cursor)
             )
             """
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS catchup_schedule ("
+            "workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, "
+            "attempt_order INTEGER NOT NULL, PRIMARY KEY (workspace_id, channel_id))"
         )
     except BaseException:
         connection.close()
@@ -720,9 +807,8 @@ async def _drain_thread(
     failure aborted this thread; the caller stops touching this channel for
     the rest of the run so ordering (and therefore checkpoint safety) holds.
 
-    The checkpoint only moves past ``since`` when either (a) a dispatch
-    failure gives an unambiguous stopping point — everything up to the last
-    success is known-good — or (b) the fetch was exhausted, meaning there is
+    The checkpoint only moves past ``since`` when the fetch was exhausted,
+    including on partial dispatch failure, meaning there is
     no unseen older reply hiding behind a truncated page. A budget-truncated
     fetch that dispatches everything it saw without error still leaves the
     checkpoint at ``since``, because Slack returns replies newest-first: a
@@ -759,7 +845,8 @@ async def _drain_thread(
             await dispatch(event)
         except Exception as exc:
             result.error = f"dispatch_failed:{reply_ts}: {exc}"
-            advance_thread_checkpoint(conn, workspace_id, channel_id, root_ts, last_reply_ts, now)
+            if exhausted:
+                advance_thread_checkpoint(conn, workspace_id, channel_id, root_ts, last_reply_ts, now)
             return False, budget
         result.dispatched += 1
         result.progressed = True
@@ -810,17 +897,22 @@ async def run_catchup(
         return results
 
     channels = sorted(set(config.source_channels) & set(allowed_channels))
-    # A shared per-run budget must not let ordinary incremental traffic from
-    # an already-completed channel starve a newly discovered channel. Keep
-    # lexical ordering within each class for deterministic behavior.
+    # Persist scheduling before awaiting a slow turn, including across restart.
+    attempted = dict(conn.execute(
+        "SELECT channel_id, attempt_order FROM catchup_schedule WHERE workspace_id = ?",
+        (workspace_id,),
+    ).fetchall())
     channels.sort(
         key=lambda channel_id: (
             is_channel_bootstrap_complete(conn, workspace_id, channel_id),
+            attempted.get(channel_id, -1),
             channel_id,
         )
     )
     lookback_floor = now - config.lookback_seconds
-    budget = config.message_limit
+    slots = config.message_limit
+    quota = max(1, config.message_limit // max(1, len(channels)))
+    attempt_order = max(attempted.values(), default=0)
 
     for channel_id in channels:
         result = ChannelCatchupResult()
@@ -828,13 +920,22 @@ async def run_catchup(
         if config.message_limit <= 0:
             result.error = "invalid_message_limit"
             continue
-        if budget <= 0:
+        if slots <= 0:
             # The budget is shared across channels for this bounded run. A
             # later channel that has not had a turn is still resumable; it is
             # not a Slack/API failure and must not stop the in-connect retry.
             result.pending = True
             continue
 
+        budget = min(quota, slots)
+        slots -= budget
+        attempt_order += 1
+        conn.execute(
+            "INSERT INTO catchup_schedule VALUES (?, ?, ?) "
+            "ON CONFLICT(workspace_id, channel_id) DO UPDATE SET attempt_order = excluded.attempt_order",
+            (workspace_id, channel_id, attempt_order),
+        )
+        result.attempts = 1
         channel_checkpoint = get_channel_checkpoint(conn, workspace_id, channel_id)
         if not is_channel_bootstrap_complete(conn, workspace_id, channel_id):
             budget = await _run_channel_bootstrap(
@@ -922,14 +1023,10 @@ async def run_catchup(
                     aborted = True
                     break
 
-        # A dispatch failure gives an unambiguous stopping point (everything
-        # before it is known-good, dispatched in order) regardless of fetch
-        # coverage. Reaching the end of the fetched list without a failure is
-        # only safe to checkpoint past when the fetch was exhausted — Slack
-        # returns roots newest-first, so a budget-truncated fetch may have
-        # skipped an older, still-undispatched tail that this run never saw.
+        # Even on failure, newest-first truncated pages can hide older roots.
+        # Exhaustion is required before checkpointing any successful prefix.
         if last_root_ts and (not channel_checkpoint or float(last_root_ts) > float(channel_checkpoint)):
-            if aborted or roots_exhausted:
+            if roots_exhausted:
                 advance_channel_checkpoint(conn, workspace_id, channel_id, last_root_ts, now)
                 result.progressed = True
 
@@ -957,3 +1054,63 @@ async def run_catchup(
                 break
 
     return results
+
+
+async def run_workspace_catchups(
+    *, clients: dict, dispatch: Callable[[dict], Awaitable[None]],
+    conn: sqlite3.Connection, config: CatchupConfig, bot_user_ids: dict,
+    max_rounds: int = 100, fetch_retries: int = 2,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> dict:
+    """Bounded fair workspace rounds with channel-local retry and totals.
+
+    Fetch failures retry with backoff; dispatch/cursor errors and stalls are
+    isolated for this invocation. Durable cursors survive the round limit.
+    Nothing here equates a pending/stalled channel with bootstrap completion.
+    """
+    if max_rounds <= 0 or fetch_retries < 0:
+        raise ValueError("invalid catch-up retry bounds")
+    remaining = {workspace: set(config.source_channels) for workspace in clients}
+    totals = {workspace: {} for workspace in clients}
+    failures = {}
+    for _ in range(max_rounds):
+        if not any(remaining.values()):
+            break
+        delay = 0.0
+        for workspace, client in clients.items():
+            if not remaining[workspace]:
+                continue
+            current = await run_catchup(
+                client=client, dispatch=dispatch, conn=conn, workspace_id=workspace,
+                allowed_channels=remaining[workspace],
+                config=replace(config, source_channels=frozenset(remaining[workspace])),
+                bot_user_id=bot_user_ids.get(workspace, ""), now=clock(),
+            )
+            next_channels = set()
+            for channel, result in current.items():
+                total = totals[workspace].setdefault(channel, ChannelCatchupResult())
+                total.dispatched += result.dispatched
+                total.skipped += result.skipped
+                total.attempts += result.attempts
+                total.progressed |= result.progressed
+                total.error, total.pending = result.error, result.pending
+                if result.error:
+                    total.first_error = total.first_error or result.error
+                    key = (workspace, channel)
+                    failures[key] = failures.get(key, 0) + 1
+                    total.pending = True
+                    if result.error.startswith(("history_fetch_failed:", "replies_fetch_failed:")):
+                        if failures[key] <= fetch_retries:
+                            next_channels.add(channel)
+                            delay = max(delay, min(2.0, 0.5 * 2 ** (failures[key] - 1)))
+                elif result.pending:
+                    if result.progressed or result.attempts == 0:
+                        next_channels.add(channel)
+                    else:
+                        total.error = "catchup_no_progress"
+                        total.first_error = total.first_error or total.error
+            remaining[workspace] = next_channels
+        if delay and any(remaining.values()):
+            await sleep(delay)
+    return totals

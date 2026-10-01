@@ -19,6 +19,7 @@ import tempfile
 import time
 import uuid
 import weakref
+from contextlib import ExitStack, nullcontext
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
@@ -2120,6 +2121,27 @@ class MessageEvent:
     # consume via ``event.metadata.get(...)`` and must not rely on any
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Adapter-owned in-process authority, not deserialized metadata.
+    execution_context: Any = field(default=None, repr=False, compare=False)
+    handler_outcome: Optional[ProcessingOutcome] = field(default=None, init=False)
+    execution_result_required: bool = field(default=False, repr=False, compare=False)
+    execution_result_received: bool = field(default=False, init=False, repr=False)
+    execution_intentional_silence: bool = field(default=False, init=False, repr=False)
+    execution_error: str = field(default="", init=False)
+
+    def record_execution_result(self, result: dict) -> None:
+        """Trusted runner outcome, independent of response text/None."""
+        self.execution_result_received = True
+        if (not isinstance(result, dict) or result.get("failed") or result.get("partial")
+                or result.get("interrupted") or result.get("error")
+                or result.get("completed") is False or not result.get("api_calls")):
+            self.handler_outcome = ProcessingOutcome.FAILURE
+            detail = str(result.get("error", "")) + str(result.get("failure_reason", "")) if isinstance(result, dict) else ""
+            self.execution_error = "model_busy" if "busy" in detail.lower() else "model_error"
+        else:
+            from gateway.response_filters import is_intentional_silence_agent_result
+            self.execution_intentional_silence = is_intentional_silence_agent_result(result, result.get("final_response", ""))
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -5765,6 +5787,20 @@ class BasePlatformAdapter(ABC):
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+        # Admission can fail before the handler's try/finally exists. Route
+        # that failure through the same lifetime cleanup without running the
+        # handler or emitting an unscoped error reply.
+        with ExitStack() as scopes:
+            try:
+                scopes.enter_context(event.execution_context() if event.execution_context else nullcontext())
+            except Exception as exc:
+                await self._process_message_background_scoped(event, session_key, admission_error=exc)
+                return
+            await self._process_message_background_scoped(event, session_key)
+
+    async def _process_message_background_scoped(
+        self, event: MessageEvent, session_key: str, *, admission_error: Optional[Exception] = None
+    ) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
@@ -5790,7 +5826,7 @@ class BasePlatformAdapter(ABC):
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
         typing_task: Optional[asyncio.Task] = None
-        if getattr(self.config, "typing_indicator", True):
+        if admission_error is None and getattr(self.config, "typing_indicator", True):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
             try:
                 _keep_typing_sig = inspect.signature(self._keep_typing)
@@ -5813,10 +5849,17 @@ class BasePlatformAdapter(ABC):
             )
         
         try:
+            if admission_error is not None:
+                raise admission_error
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            if event.execution_result_required and not event.execution_result_received:
+                event.handler_outcome = ProcessingOutcome.FAILURE
+                event.execution_error = "model_outcome_missing"
+            elif event.handler_outcome is None:
+                event.handler_outcome = ProcessingOutcome.SUCCESS
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6323,16 +6366,20 @@ class BasePlatformAdapter(ABC):
                 
         except asyncio.CancelledError:
             current_task = asyncio.current_task()
+            event.handler_outcome = ProcessingOutcome.CANCELLED
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
+            event.handler_outcome = ProcessingOutcome.FAILURE
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
+                if admission_error is not None:
+                    return
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
@@ -6378,7 +6425,7 @@ class BasePlatformAdapter(ABC):
                 )
             else:
                 _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
-            if callable(_post_cb):
+            if admission_error is None and callable(_post_cb):
                 try:
                     _post_result = _post_cb()
                     if inspect.isawaitable(_post_result):
