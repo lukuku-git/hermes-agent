@@ -5463,7 +5463,7 @@ class SlackAdapter(BasePlatformAdapter):
         # must not suppress each other.
         event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
         dedup_team_id = self._event_team_id(event, payload)
-        if event_ts and self._dedup.is_duplicate(
+        if event_ts and not observer_catchup.is_archive_replay(event) and self._dedup.is_duplicate(
             self._workspace_event_id(dedup_team_id, event_ts)
         ):
             return
@@ -6574,7 +6574,7 @@ class SlackAdapter(BasePlatformAdapter):
                 if outcome is None and msg_event.execution_intentional_silence:
                     delivery.record_skip("intentional_skip")
                     outcome = "intentional_skip"
-                if outcome not in {"success", "closed", "protected", "intentional_skip"}:
+                if outcome not in {"success", "closed", "protected", "intentional_skip", "deferred"}:
                     self._processed_message_ts.pop(ts, None)
                     raise observer_catchup.ReplayNotCompleted("business_outcome_unknown")
 
@@ -8768,10 +8768,14 @@ class SlackAdapter(BasePlatformAdapter):
             manifest = operator.manifest()
             if manifest["state"] == "planned":
                 return
+            if manifest["state"] == "done":
+                await self._run_observer_unlinked_replay()
             await operator.round(self, observer_catchup)
             # A fixed manifest exclusively owns historical replay, including
             # continuing/done. Genuine live delivery uses its separate gate.
             return
+
+        await self._run_observer_unlinked_replay()
 
         async def dispatch_with_recovery_priority(event):
             # Slot boundary only: never cancel a running actual owner/drain.
@@ -8810,6 +8814,13 @@ class SlackAdapter(BasePlatformAdapter):
                         "[Slack] Observer catch-up for %s/%s: dispatched=%d skipped=%d",
                         team_id, channel_id, result.dispatched, result.skipped,
                     )
+
+    async def _run_observer_unlinked_replay(self) -> None:
+        try:
+            from hermes_plugins.offon import unlinked
+        except ImportError:
+            from plugins.offon import unlinked
+        await unlinked.replay_round(self, observer_catchup)
 
     # A replayed turn normally completes in seconds. On 2026-10-02 the fixed
     # replay sat for over ten minutes on a completion that never came while no

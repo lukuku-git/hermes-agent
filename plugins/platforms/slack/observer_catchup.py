@@ -44,6 +44,22 @@ from contextvars import ContextVar
 
 
 _CUSTOMER_OUTPUT_BLOCKED = ContextVar("observer_customer_output_blocked", default=False)
+_ARCHIVE_REPLAY = ContextVar("observer_archive_replay", default=None)
+
+
+@contextmanager
+def archive_replay_scope(channel, root, message):
+    """Runner-only capability; event metadata cannot bypass a completed claim."""
+    token = _ARCHIVE_REPLAY.set((channel, root, message))
+    try:
+        yield
+    finally:
+        _ARCHIVE_REPLAY.reset(token)
+
+
+def is_archive_replay(event):
+    key = (event.get("channel"), event.get("thread_ts") or event.get("ts"), event.get("ts"))
+    return _CUSTOMER_OUTPUT_BLOCKED.get() and _ARCHIVE_REPLAY.get() == key
 
 
 @contextmanager
@@ -129,6 +145,9 @@ def claim_gated_message(method):
     """
     @wraps(method)
     async def wrapped(self, event: dict, payload: Optional[dict] = None) -> None:
+        if is_archive_replay(event):
+            await method(self, event, payload)
+            return
         if not self._slack_history_catchup_enabled():
             await method(self, event, payload)
             return
